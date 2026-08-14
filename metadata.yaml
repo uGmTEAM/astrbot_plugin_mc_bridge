@@ -1,8 +1,8 @@
 name: astrbot_plugin_mc_bridge
 display_name: MC服务器桥接
-desc: 连接本地Minecraft(Paper/Spigot)服务器，将玩家聊天记录为虚拟群聊会话；当玩家@机器人或消息含关键词时，LLM基于会话上下文生成回复，通过tellraw发送回MC服务器。支持桥接HTTP与RCON双通道回传。
-version: 1.0.0
-author: trae
+desc: 支持多台本地/远程 Minecraft(Paper/Spigot) 服务器接入，将玩家聊天记录为按服隔离的虚拟群聊会话；正版验证服可基于正版UUID跨服合并记忆/印象/上下文。支持同步到 memory_companion 与 交互印象(impression) 插件。管理员可通过 AstrBot 自然语言 LLM工具 或 /mc 指令执行 MC 管理/操作/查询/运维四类命令。支持桥接HTTP与RCON双通道回传 tellraw。
+version: 2.0.0
+author: uGmTEAM
 repo: ""
 tags:
   - minecraft
@@ -10,3 +10,7 @@ tags:
   - 桥接
   - 聊天记录
   - tellraw
+  - memory_companion
+  - impression
+  - 多服务器
+astrbot_version: ">=4.5.7"
