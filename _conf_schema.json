@@ -1,0 +1,20 @@
+{
+    "MC_HOST": {"description": "【连接】Minecraft服务器地址", "type": "string", "default": "127.0.0.1"},
+    "LISTEN_PORT": {"description": "【连接】AstrBot端接收MC推送的HTTP监听端口", "type": "int", "default": 6188, "hint": "MC端Bukkit插件把玩家聊天POST到 http://<本机IP>:该端口/mc_chat"},
+    "BRIDGE_TOKEN": {"description": "【连接】双向通信鉴权Token(与MC端插件保持一致)", "type": "string", "default": "", "hint": "为空则不鉴权；本地使用仍建议设置以防误访问"},
+    "SEND_CHANNEL": {"description": "【回传】tellraw发回MC的通道", "type": "string", "default": "bridge", "options": ["bridge", "rcon"], "hint": "bridge=走MC端桥接HTTP接口(需MC端插件运行); rcon=走RCON协议直连(需服务端开启rcon)"},
+    "MC_BRIDGE_PORT": {"description": "【回传·桥接】MC端Bukkit插件的HTTP监听端口", "type": "int", "default": 25580},
+    "MC_RCON_PORT": {"description": "【回传·RCON】MC服务器RCON端口(server.properties的rcon.port)", "type": "int", "default": 25575},
+    "MC_RCON_PASSWORD": {"description": "【回传·RCON】MC服务器RCON密码(server.properties的rcon.password)", "type": "string", "default": ""},
+    "LLM_REPLY_ENABLED": {"description": "【回复·开关】启用LLM自动回复被触发的消息", "type": "bool", "default": true},
+    "BOT_NAME": {"description": "【回复】机器人在MC中的显示名(tellraw前缀)", "type": "string", "default": "Kei"},
+    "TELLRAW_TEMPLATE": {"description": "【回复】tellraw消息格式模板", "type": "text", "default": "§7<{BOT_NAME}> {message}", "hint": "占位符:{BOT_NAME}=机器人名 {message}=回复内容。可使用Minecraft颜色代码§"},
+    "TRIGGER_KEYWORDS": {"description": "【触发】触发LLM回复的关键词列表(消息含任一即触发)", "type": "list", "default": ["Kei", "机器人"]},
+    "ENABLE_AT_TRIGGER": {"description": "【触发】启用@机器人触发(消息以机器人名开头或含@机器人名)", "type": "bool", "default": true},
+    "MAX_HISTORY": {"description": "【会话】虚拟会话保留的最大消息条数", "type": "int", "default": 200},
+    "LLM_CONTEXT_COUNT": {"description": "【会话】调用LLM时携带的近期消息条数", "type": "int", "default": 20},
+    "PLAYER_NAME_MAP": {"description": "【玩家映射】MC玩家名→会话昵称映射(JSON字符串)", "type": "text", "default": "", "hint": "如 {\"Steve\":\"史蒂夫\"}；留空则不映射"},
+    "PLAYER_WHITELIST": {"description": "【过滤·白名单】仅记录这些玩家的消息(留空=记录全部)", "type": "list", "default": []},
+    "PLAYER_BLACKLIST": {"description": "【过滤·黑名单】不记录这些玩家的消息", "type": "list", "default": []},
+    "MESSAGE_FILTER_KEYWORDS": {"description": "【过滤·消息】含这些词的消息不记录、不触发回复", "type": "list", "default": []}
+}
