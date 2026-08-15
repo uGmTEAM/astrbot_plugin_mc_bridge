@@ -105,6 +105,15 @@ class ServerCfg:
     player_blacklist: list[str] = field(default_factory=list)
     message_filter: list[str] = field(default_factory=list)
 
+    @staticmethod
+    def _split_csv(val) -> list[str]:
+        """将逗号分隔的字符串解析为列表。兼容旧版已是列表的情况。"""
+        if not val:
+            return []
+        if isinstance(val, list):
+            return [str(x).strip() for x in val if str(x).strip()]
+        return [x.strip() for x in str(val).split(",") if x.strip()]
+
     @classmethod
     def from_dict(cls, d: dict) -> "ServerCfg":
         return cls(
@@ -118,12 +127,12 @@ class ServerCfg:
             mc_rcon_password=str(d.get("mc_rcon_password", "") or ""),
             bot_name=str(d.get("bot_name", "Kei") or "Kei").strip() or "Kei",
             tellraw_template=str(d.get("tellraw_template") or "§7<{BOT_NAME}> {message}"),
-            trigger_keywords=[str(x) for x in (d.get("trigger_keywords") or []) if x],
+            trigger_keywords=cls._split_csv(d.get("trigger_keywords")),
             enable_at_trigger=bool(d.get("enable_at_trigger", True)),
             online_mode=bool(d.get("online_mode", False)),
-            player_whitelist=[str(x) for x in (d.get("player_whitelist") or []) if x],
-            player_blacklist=[str(x) for x in (d.get("player_blacklist") or []) if x],
-            message_filter=[str(x) for x in (d.get("message_filter") or []) if x],
+            player_whitelist=cls._split_csv(d.get("player_whitelist")),
+            player_blacklist=cls._split_csv(d.get("player_blacklist")),
+            message_filter=cls._split_csv(d.get("message_filter")),
         )
 
 
@@ -214,16 +223,24 @@ class MCBridgePlugin(Star):
     # ------------------------------------------------------------------ 配置解析
 
     def _parse_servers_config(self):
-        raw = str(self.config.get("SERVERS", "") or "").strip()
+        """解析 SERVERS 配置。template_list 类型直接返回 list[dict]，无需 json.loads。"""
+        raw = self.config.get("SERVERS", [])
         if not raw:
             return
-        try:
-            lst = json.loads(raw)
-        except Exception as e:
-            logger.warning(f"[MCBridge] SERVERS JSON 解析失败: {e}，退化为空")
-            return
+        # 兼容：如果用户旧的 text 类型残留了 JSON 字符串，尝试解析
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if not raw:
+                return
+            try:
+                lst = json.loads(raw)
+            except Exception as e:
+                logger.warning(f"[MCBridge] SERVERS JSON 解析失败: {e}，退化为空")
+                return
+        else:
+            lst = raw
         if not isinstance(lst, list):
-            logger.warning("[MCBridge] SERVERS 必须是 JSON 数组，当前被忽略")
+            logger.warning("[MCBridge] SERVERS 必须是列表，当前被忽略")
             return
         ports_seen: set[int] = set()
         for item in lst:

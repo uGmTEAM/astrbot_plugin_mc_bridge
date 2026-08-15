@@ -72,7 +72,7 @@ user:mcs[uuid:<玩家正版UUID>].<玩家名>
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |:-------|:-----|:-------|:-----|
-| **SERVERS** | text(JSON数组) | — | **【核心】** 多服务器配置数组，见下一节样例。 |
+| **SERVERS** | template_list | — | **【核心】** 多服务器可视化表单列表。点击「添加」新增服务器，见下一节详述。 |
 | ASTRBOT_LISTEN_HOST | string | `0.0.0.0` | HTTP 接收服务绑定的主机 IP。同机部署可改 `127.0.0.1` 增强安全。 |
 | SUPER_ADMIN_IDS | text(逗号分隔) | `""` | 超级管理员ID列表(QQ号/AstrBot平台用户ID)，拥有**全部**MC指令权限。 |
 | ADMIN_CAN_QUERY_ONLY | bool | `true` | PermissionType.ADMIN 群管是否只能执行 `查询类 + 插件运维类`；禁用后只有 SUPER_ADMIN 能做任何MC操作。 |
@@ -90,79 +90,87 @@ user:mcs[uuid:<玩家正版UUID>].<玩家名>
 | ENABLE_SYNC_TO_IMPRESSION | bool | `true` | 是否为 MC 玩家生成/更新交互印象(impression插件)。 |
 | IMPRESSION_TRIGGER_COUNT | int | `8` | MC 玩家累计交互多少次，触发一次印象 LLM 更新。 |
 
-### 4.2 SERVERS JSON 数组 —— 每台服务器的配置
+### 4.2 SERVERS —— 可视化表单配置（template_list）
 
-每个元素是一个对象，字段表：
+在 AstrBot WebUI 的插件配置页面，SERVERS 是一个 **可视化列表**（`template_list` 类型），无需手写 JSON：
 
-| 字段 | 类型 | 必填 | 默认值 | 说明 |
-|:-----|:-----|:----:|:-------|:-----|
-| `name` | string | ✅ | — | 服务器名。用户标签 `mcs[name].xxx` 会用到；必须唯一。**必须与 MC 端 `config.yml` 的 `server_name` 一致**。 |
-| `host` | string | | `127.0.0.1` | 这台 MC 服务器的 IP（本插件向它回传 tellraw 时用）。 |
-| `listen_port` | int | ✅ | `6188` | AstrBot 端为这台服务器独占的 HTTP 监听端口（接收它的聊天/握手）。**每台服必须不同**。 |
-| `bridge_token` | string | | `""` | 双向鉴权 Token。与 MC 端 `bridge_token` 填一样；空字符串表示不鉴权。 |
-| `send_channel` | string | | `"bridge"` | 回传通道选择：`bridge` 走 MC 端插件 HTTP；`rcon` 走原生 RCON。 |
-| `mc_bridge_port` | int | | `25580` | `send_channel=bridge` 时用，MC 端插件 HTTP 监听端口（对应 MC 端 `bridge_listen_port`）。 |
-| `mc_rcon_port` | int | | `25575` | `send_channel=rcon` 时用，MC 原生 RCON 端口。 |
-| `mc_rcon_password` | string | | `""` | `send_channel=rcon` 时用，MC 原生 RCON 密码。 |
-| `bot_name` | string | | `"Kei"` | 本服机器人的显示名。LLM 以它身份说话，tellraw 模板里会替换 `{BOT_NAME}`。 |
-| `tellraw_template` | string | | `"§7<{BOT_NAME}> {message}"` | tellraw 显示模板，支持两个占位符 `{BOT_NAME}` 和 `{message}`。支持 `§` 颜色代码。 |
-| `trigger_keywords` | string[] | | `["Kei","机器人"]` | 玩家消息里包含任一关键词即触发 LLM 回复。 |
-| `enable_at_trigger` | bool | | `true` | 玩家消息以 `@{bot_name}` 或 `{bot_name}` 开头时是否触发。 |
-| `online_mode` | bool | | `false` | 是否正版验证服。**建议不要手动填**；MC 端启动时会通过握手自动用 `Bukkit.getOnlineMode()` 覆盖并持久化这个值。 |
-| `player_whitelist` | string[] | | `[]` | 玩家白名单（玩家名）。非空时只有白名单玩家的消息会被记录/触发。 |
-| `player_blacklist` | string[] | | `[]` | 玩家黑名单。命中直接忽略。 |
-| `message_filter` | string[] | | `[]` | 消息关键词黑名单。消息含任一关键词直接忽略。 |
+1. 点击 **「添加」** 按钮，新增一台 MC 服务器
+2. 在展开的表单里逐项填写配置
+3. 需要多台服务器就点多次「添加」
+
+每台服务器的表单字段说明：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|:-----|:-----|:-------|:-----|
+| 服务器名称 | string | `survival` | 唯一标识。必须与 MC 端 `config.yml` 的 `server_name` 一致。标签格式 `mcs[名称].玩家名`。 |
+| MC服务器IP | string | `127.0.0.1` | 本插件向该服回传 tellraw 时连接的 IP。同机部署填 `127.0.0.1`。 |
+| AstrBot监听端口 | int | `6188` | 本插件为该服务器独占的 HTTP 监听端口。**每台服必须不同**（如 6188、6189...）。 |
+| 鉴权Token | string | `""` | 与 MC 端 `bridge_token` 填一致，为空则不鉴权。生产环境务必设置。 |
+| 回传通道 | string(下拉) | `bridge` | `bridge` = 走 MC 端插件 HTTP；`rcon` = 走原生 RCON。 |
+| MC端HTTP端口 | int | `25580` | `send_channel=bridge` 时用，对应 MC 端 `bridge_listen_port`。 |
+| RCON端口 | int | `25575` | `send_channel=rcon` 时用。 |
+| RCON密码 | string | `""` | `send_channel=rcon` 时用。 |
+| 机器人显示名 | string | `Kei` | 本服机器人名字，tellraw 模板里 `{BOT_NAME}` 替换为此值。 |
+| tellraw消息模板 | string | `§7<{BOT_NAME}> {message}` | 支持 `{BOT_NAME}` 和 `{message}` 占位符，支持 `§` 颜色代码。 |
+| 触发关键词 | string | `Kei,机器人` | 玩家消息含任一关键词即触发 LLM 回复。**多个用英文逗号分隔**。 |
+| 启用@触发 | bool | `true` | 玩家消息以 `@机器人名` 或 `机器人名` 开头时触发回复。 |
+| 正版验证 | bool | `false` | 建议不手动填。MC 端启动握手会自动用 `Bukkit.getOnlineMode()` 覆盖此值。 |
+| 玩家白名单 | string | `""` | 非空时只有白名单玩家的消息会被记录。留空=不限制。**逗号分隔**。 |
+| 玩家黑名单 | string | `""` | 命中直接忽略。**逗号分隔**。 |
+| 消息过滤词 | string | `""` | 消息含任一关键词直接忽略。**逗号分隔**。 |
+
+> **提示**：`trigger_keywords`、`player_whitelist`、`player_blacklist`、`message_filter` 这4个字段在表单里用英文逗号分隔多个值（如 `Kei,机器人,小樱`）。由于 AstrBot 的 `template_list` 不支持嵌套列表，所以采用逗号分隔方式。
 
 ### 4.3 MC 端 `plugins/McAstrbotBridge/config.yml`
 
 | 字段 | AstrBot 端对应字段 |
 |:-----|:-------------------|
-| `server_name` | `SERVERS[*].name`（必须一致） |
-| `astrbot_host` / `astrbot_port` | AstrBot 部署的 IP + `SERVERS[*].listen_port` |
-| `bridge_token` | `SERVERS[*].bridge_token`（必须一致） |
-| `bridge_listen_port` | `SERVERS[*].mc_bridge_port`（`send_channel=bridge` 时必须一致） |
+| `server_name` | 服务器名称（必须一致） |
+| `astrbot_host` / `astrbot_port` | AstrBot 部署的 IP + AstrBot监听端口 |
+| `bridge_token` | 鉴权Token（必须一致） |
+| `bridge_listen_port` | MC端HTTP端口（`send_channel=bridge` 时必须一致） |
 | `push_chat` | 是否推送聊天（true/false） |
 
-### 4.4 完整的多服务器配置样例
+### 4.4 多服务器配置示例
 
 假设你有：
 - **Survival 生存服**（正版验证，同机部署，回传走 bridge）
 - **Creative 创造服**（离线服，在另一台机器 `192.168.1.20`，回传走 RCON）
 
-**AstrBot 端 SERVERS 粘贴这段：**
+**AstrBot 端 WebUI 操作：**
 
-```json
-[
-  {
-    "name": "survival",
-    "host": "127.0.0.1",
-    "listen_port": 6188,
-    "bridge_token": "MySecretToken_123",
-    "send_channel": "bridge",
-    "mc_bridge_port": 25580,
-    "bot_name": "Kei",
-    "tellraw_template": "§7<{BOT_NAME}> {message}",
-    "trigger_keywords": ["Kei", "机器人"],
-    "enable_at_trigger": true,
-    "player_whitelist": [],
-    "player_blacklist": [],
-    "message_filter": []
-  },
-  {
-    "name": "creative",
-    "host": "192.168.1.20",
-    "listen_port": 6189,
-    "bridge_token": "CreativeToken_456",
-    "send_channel": "rcon",
-    "mc_rcon_port": 25575,
-    "mc_rcon_password": "MyRconPasswd!!",
-    "bot_name": "Sakura",
-    "tellraw_template": "§d<{BOT_NAME}> §f{message}",
-    "trigger_keywords": ["Sakura", "小樱"],
-    "enable_at_trigger": true
-  }
-]
-```
+在 SERVERS 配置区点击两次「添加」，分别填写：
+
+**第1台 - Survival：**
+
+| 字段 | 值 |
+|:-----|:---|
+| 服务器名称 | `survival` |
+| MC服务器IP | `127.0.0.1` |
+| AstrBot监听端口 | `6188` |
+| 鉴权Token | `MySecretToken_123` |
+| 回传通道 | `bridge` |
+| MC端HTTP端口 | `25580` |
+| 机器人显示名 | `Kei` |
+| tellraw消息模板 | `§7<{BOT_NAME}> {message}` |
+| 触发关键词 | `Kei,机器人` |
+| 启用@触发 | ✅ |
+
+**第2台 - Creative：**
+
+| 字段 | 值 |
+|:-----|:---|
+| 服务器名称 | `creative` |
+| MC服务器IP | `192.168.1.20` |
+| AstrBot监听端口 | `6189` |
+| 鉴权Token | `CreativeToken_456` |
+| 回传通道 | `rcon` |
+| RCON端口 | `25575` |
+| RCON密码 | `MyRconPasswd!!` |
+| 机器人显示名 | `Sakura` |
+| tellraw消息模板 | `§d<{BOT_NAME}> §f{message}` |
+| 触发关键词 | `Sakura,小樱` |
+| 启用@触发 | ✅ |
 
 **Survival 服 MC 端 config.yml：**
 
