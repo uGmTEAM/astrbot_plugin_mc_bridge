@@ -898,47 +898,32 @@ class MCBridgePlugin(Star):
           创造/物品/资源：gamemode / give / clear / summon / setblock / fill / clone
           服管：stop / restart / op / deop / whitelist / pardon
           原始命令：任何以 /mc_ 开头的 AstrBot 命令
+
+        【关键设计】：该调用走 _llm_generate_clean(skip_persona=True)，
+        不叠加 AstrBot 默认 persona、印象、记忆等钩子，避免模型输出"我不是仓库管理员"
+        这类与指令路由任务完全无关的、来自聊天人设立场的拒绝。
         """
         dangerous = r"\b(kick|ban|pardon|op|deop|whitelist|stop|restart|gamemode|give|clear|summon|setblock|fill|clone|execute\s+as|effect)\b"
         MUST_HAVE_HINT = "请直接使用游戏内命令（非自然语言）"
-        # 快速命中：如果用户直接写了"把xxx ban了"等强危险词，直接走LLM出拒绝
-        sp = await self._get_system_prompt()
+        ROLE_PROMPT = (
+            "你是 Minecraft 服务器的「指令路由器」，不是聊天助手，也不是玩家的朋友或管家。"
+            "你没有任何身份、性格或人设。你的唯一职责就是严格输出一段 JSON。"
+            "禁止输出任何 JSON 代码块之外的文字，禁止用自然语言解释、道歉、拒绝、寒暄。"
+        )
         lines = [
-            "你是MC服务器管理员的命令路由助手。任务：把玩家的自然语言请求，判定为以下3种动作之一。",
-            "动作1：execute_safe = 安全查询指令（time/weather/help/list/me/say/tp自己等不会影响他人的小指令），必须输出一条具体的 Minecraft 命令。",
-            f"动作2：deny = 危险指令（踢/ban/op/gamemode/give/setblock/fill/summon/stop/whitelist等影响他人/服务器状态的指令，或权限不足的操作），你需要用自然语言生成一段礼貌的拒绝说明（为什么不能这样做、权限/风险等），并且 message 字段结尾必须包含——「{MUST_HAVE_HINT}」。",
-            '动作3：not_command = 这不是指令意图，只是普通闲聊（如"今天天气不错"/"你好"），输出 message 字段解释不是指令。',
-            f"当前玩家权限等级={perm}（仅 superadmin/admin 能做更重操作，member只能做查询/自操作，unbound不允许执行）。",
+            "任务：把玩家的自然语言请求，判定为以下 3 种动作之一，并用 JSON 输出。",
+            "动作1：execute_safe = 安全查询/自操作类指令（time/weather/help/list/me/say/tp 自己等不会影响他人的小指令），必须输出一条具体的 Minecraft 命令。",
+            f"动作2：deny = 危险指令（踢/ban/op/gamemode/give/setblock/fill/summon/stop/whitelist 等影响他人/服务器状态的指令，或权限不足的操作），用自然语言写一段礼貌的拒绝说明（为什么不能这样做、权限/风险等），并且 message 结尾必须包含「{MUST_HAVE_HINT}」。",
+            '动作3：not_command = 这不是指令意图，只是普通闲聊（如"今天天气不错"/"你好"），或你无法识别为可执行 MC 指令的请求，输出 message 字段简短解释为什么不是指令。',
+            f"当前玩家权限等级={perm}（仅 superadmin/admin 能做更重操作，member 只能做查询/自操作，unbound 不允许执行）。",
             f"玩家={display or player}, 服务器={sv.name}",
-            "你必须严格输出 JSON，格式：{\"action\":\"...\", \"command\":\"/xxx\", \"message\":\"...\"}，不允许输出任何解释文字。",
+            "输出格式必须是纯 JSON，不要加 markdown、不要加 ```json、不要加注释。格式：",
+            "{\"action\":\"execute_safe|deny|not_command\", \"command\":\"/xxx 仅当action=execute_safe时填\", \"message\":\"解释或拒绝语\"}",
             "",
             "玩家原话：" + content,
         ]
         prompt = "\n".join(lines)
-        raw = await self._llm_generate_text(prompt, sp or "你是严谨的MC指令路由器，只输出JSON。")
-        if not raw:
-            return {"action": "not_command", "message": "LLM未返回解析结果。"}
-        # 剥离```json包裹
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        data = {}
-        try:
-            data = json.loads(raw)
-        except Exception:
-            # 从文本里尽量取
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    data = json.loads(m.group(0))
-                except Exception:
-                    data = {}
-        if not isinstance(data, dict):
-            data = {}
-        action = str(data.get("action", "")).strip().lower()
-        # 最终的危险兜底：即使LLM放行了 dangerous 命令，也把动作改为 deny。
-        proposed_cmd = str(data.get("command", "")).strip()
+        raw = await self._llm_generate_clean(prompt, ROLE_PROMPT, skip_persona=True)
 
         def _ensure_hint(msg: str) -> str:
             m = (msg or "").strip()
@@ -948,15 +933,54 @@ class MCBridgePlugin(Star):
                 return m
             return f"{m}（{MUST_HAVE_HINT}）"
 
+        # ---- 兜底1：LLM 根本没返回，或返回里出现"人设式拒绝"（即使 skip_persona 也防一层） ----
+        persona_refuse_re = r"(我不是|我不能|我无法|我只是|做不到|没有这个能力|没有权限|无法帮助|不能帮助|不能替你|不负责|我是一个)(仓库|管理|OP|服主|管理员|游戏内|服务器|物品|搬|取|箱子|红石|指令|命令)"
+        if not raw:
+            return {"action": "not_command", "message": "指令识别失败：LLM未返回结果。"}
+        raw_stripped = raw.strip()
+        if re.search(persona_refuse_re, raw_stripped, re.I):
+            # 说明 model / hook 仍强行注入了"聊天人设"拒绝：把它改写成玩家可理解的解释 + 强制不是指令
+            # 如果内容里含有危险词，则当作危险拒绝处理
+            if re.search(dangerous, content, re.I):
+                return {"action": "deny", "message": _ensure_hint("")}
+            return {
+                "action": "not_command",
+                "message": "没有从你的话里识别出可执行的MC指令。识别危险指令（给物品/踢人/改模式等）请直接使用游戏内命令（非自然语言）。",
+            }
+        # ---- 剥离 ```json 包裹 ----
+        if raw_stripped.startswith("```"):
+            raw_stripped = re.sub(r"^```(?:json)?\s*", "", raw_stripped)
+            raw_stripped = re.sub(r"\s*```$", "", raw_stripped)
+        data = {}
+        try:
+            data = json.loads(raw_stripped)
+        except Exception:
+            # 从文本里尽量取 JSON 子串
+            m = re.search(r"\{[\s\S]*\}", raw_stripped)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    data = {}
+        if not isinstance(data, dict):
+            data = {}
+        action = str(data.get("action", "")).strip().lower()
+        proposed_cmd = str(data.get("command", "")).strip()
+
+        # ---- 最终危险兜底：即使 LLM 把危险词放行成 execute_safe，也强制改回 deny ----
         if proposed_cmd and re.search(dangerous, proposed_cmd, re.I):
             return {"action": "deny", "message": _ensure_hint(data.get("message") or "")}
+        # 用户原话里含危险词，但 LLM 误判成 not_command/execute_safe 且没给出 command：按 deny 算
+        if (not proposed_cmd) and re.search(dangerous, content, re.I) and action != "deny":
+            return {"action": "deny", "message": _ensure_hint(data.get("message") or "")}
+
         if action == "execute_safe":
             if not proposed_cmd:
-                return {"action": "not_command", "message": "没有识别出具体指令。"}
+                return {"action": "not_command", "message": "没有识别出具体可执行指令。你可以直接用游戏内命令。"}
             return {"action": "execute_safe", "command": proposed_cmd}
         if action == "deny":
             return {"action": "deny", "message": _ensure_hint(data.get("message") or "")}
-        return {"action": "not_command", "message": data.get("message") or "没有识别出指令意图。"}
+        return {"action": "not_command", "message": str(data.get("message") or "没有识别出指令意图。")}
 
     # ---------- 主入口：_on_mc_message ------------
     async def _on_mc_message(
@@ -1151,13 +1175,40 @@ class MCBridgePlugin(Star):
             return None
 
     async def _llm_generate_text(self, prompt: str, system_prompt: str) -> Optional[str]:
+        """普通聊天式 LLM 调用：叠加默认 persona（_get_system_prompt），走 AstrBot 原生 llm_generate 钩子链。
+        适用：MC/QQ 侧普通闲聊回复、印象生成。"""
+        return await self._llm_generate_clean(prompt, system_prompt, skip_persona=False)
+
+    async def _llm_generate_clean(self, prompt: str, system_prompt: str, *, skip_persona: bool = False) -> Optional[str]:
+        """底层 LLM 调用。
+        - skip_persona=False（默认）：system_prompt 会叠加 AstrBot 默认人设 prompt，适合普通聊天。
+        - skip_persona=True：**完全不叠加**默认人设/印象/记忆等任何 AstrBot 钩子注入的 system 内容，
+          只使用调用方显式传入的 system_prompt 作为角色约束。适用于：
+          * MC 自然语言指令路由（必须严格输出 JSON，不能冒出"我不是仓库管理员"这类人设拒绝）
+          * 其它要求 LLM 输出严格结构化 JSON 的任务。
+        """
         provider_id = self._get_provider_id()
         if not provider_id:
             logger.warning("[MCBridge] 未找到可用的 LLM provider，跳过回复")
             return None
         kwargs = {"chat_provider_id": provider_id, "prompt": prompt}
-        if system_prompt:
-            kwargs["system_prompt"] = system_prompt
+        if skip_persona:
+            # 关键：显式传我们自带的干净 system_prompt，并且不走 _get_system_prompt 叠加。
+            # llm_generate 收到非空的 system_prompt 参数时，通常会以"传入者优先"覆盖默认人设。
+            # 为了保险同时避免印象插件在 pre_invoke 钩子内改写 system_prompt，这里用一个"明确覆盖"的策略：
+            # 如果最终文本里含"我不是仓库管理员"等不相关拒绝，说明钩子链仍被注入——解析层会兜底处理。
+            if system_prompt:
+                kwargs["system_prompt"] = system_prompt
+        else:
+            # 默认模式：合并默认 persona + 调用方传入的额外角色约束（如果有）
+            default_sp = await self._get_system_prompt()
+            merged = ""
+            if default_sp:
+                merged = default_sp
+            if system_prompt:
+                merged = (merged + "\n\n" + system_prompt) if merged else system_prompt
+            if merged:
+                kwargs["system_prompt"] = merged
         try:
             resp = await self.context.llm_generate(**kwargs)
             text = resp.completion_text if resp else None
