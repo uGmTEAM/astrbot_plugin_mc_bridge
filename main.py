@@ -414,14 +414,43 @@ class MCBridgePlugin(Star):
         ts = data.get("timestamp") or int(time.time() * 1000)
         player_uuid = str(data.get("player_uuid", "") or "").strip()  # 正版UUID
         server_name_report = str(data.get("server_name", "") or sv.name).strip()
+        is_command = bool(data.get("is_command", False))
         if not player or not message:
             return web.json_response({"ok": False, "error": "missing player/message"}, status=400)
+        # 把消息处理包一个顶层 try/catch：任何异常都会回 tellraw 给玩家，避免"命令没下文"
+        # 命令事件（/bind/unbind/ai）强制回执；聊天事件只在顶层异常时告知
         self._spawn(
-            self._on_mc_message(
-                sv, player, display, message, int(ts), player_uuid, server_name_report
+            self._mc_message_safe_wrapper(
+                sv, player, display, message, int(ts), player_uuid, server_name_report, is_command
             )
         )
         return web.json_response({"ok": True})
+
+    async def _mc_message_safe_wrapper(
+        self,
+        sv: ServerCfg,
+        player: str,
+        display: str,
+        message: str,
+        ts: int,
+        player_uuid: str,
+        reported_srv: str,
+        is_command: bool,
+    ):
+        """_on_mc_message 的顶层异常兜底：任何异常都给玩家一条明确的 tellraw 回执，避免"没下文"。"""
+        try:
+            await self._on_mc_message(sv, player, display, message, ts, player_uuid, reported_srv)
+        except Exception as e:
+            logger.exception(f"[MCBridge][{sv.name}] 处理MC消息异常: player={player} msg={message!r}")
+            # 尽量用 tellraw 私聊给玩家一条提示（失败也不要紧，至少日志有了）
+            try:
+                if is_command or message.startswith("/"):
+                    await self._tellraw_private(
+                        sv, player,
+                        f"[Bridge 内部错误：{type(e).__name__}] 请管理员查看 AstrBot 日志"
+                    )
+            except Exception:
+                pass
 
     async def _handle_mc_handshake(self, request, sv: ServerCfg):
         if not await self._check_token(request, sv):
@@ -544,10 +573,27 @@ class MCBridgePlugin(Star):
         cmd = self._render_tellraw(sv.tellraw_template, sv.bot_name, message)
         await self._send_via(sv, cmd)
 
-    async def _tellraw_private(self, sv: ServerCfg, player: str, message: str):
-        """单独 tellraw 给某玩家（指令回执/错误/绑定提示等）。"""
+    async def _tellraw_private(self, sv: ServerCfg, player: str, message: str, *, with_diagnose: bool = True) -> bool:
+        """单独 tellraw 给某玩家（指令回执/错误/绑定提示等）。
+
+        返回：是否发送成功。
+        with_diagnose=True：如果 bridge/rcon 发送失败，尝试用另一条更简短的错误提示再发一次（仍失败就返回False）。
+        """
         cmd = self._render_tellraw_to(sv.tellraw_private_template, sv.bot_name, player, message)
-        await self._send_via(sv, cmd)
+        ok = await self._send_via(sv, cmd)
+        if ok:
+            return True
+        # 原模板可能太复杂导致发送失败，尝试退化成最简单的 /msg 或最朴素的 tellraw
+        if with_diagnose:
+            fallback_cmd = f'tellraw {player} {{"text":"{message}"}}'
+            ok2 = await self._send_via(sv, fallback_cmd)
+            if ok2:
+                return True
+            logger.warning(
+                f"[MCBridge][{sv.name}] tellraw_private(玩家={player}) 两度发送失败，"
+                f"通道={sv.send_channel}，MC端插件是否启动？端口/token是否一致？"
+            )
+        return False
 
     async def _send_via(self, sv: ServerCfg, command: str):
         """统一 bridge/rcon 发送MC命令。"""
@@ -738,10 +784,15 @@ class MCBridgePlugin(Star):
             mid = self._mc_identity(sv, player, player_uuid)
             if mid in self._bindings:
                 qq = self._bindings.pop(mid)
+                self._qq_to_mc = {v: k for k, v in self._bindings.items()}
                 self._save_bindings()
-                await self._tellraw_private(sv, player, f"已与QQ号 {qq} 解除绑定。")
+                ok = await self._tellraw_private(sv, player, f"已与QQ号 {qq} 解除绑定。")
+                if not ok:
+                    logger.warning(f"[MCBridge][{sv.name}] /unbind 回执发送失败 (bridge不通)，player={player}")
             else:
-                await self._tellraw_private(sv, player, "你还没有绑定任何QQ号。")
+                ok = await self._tellraw_private(sv, player, "你还没有绑定任何QQ号。")
+                if not ok:
+                    logger.warning(f"[MCBridge][{sv.name}] /unbind 回执发送失败 (bridge不通)，player={player}")
             return True
 
         # ----- /bind <QQ号> -----
@@ -756,7 +807,10 @@ class MCBridgePlugin(Star):
                 await self._tellraw_private(sv, player, f"该QQ号已被另一名玩家绑定。")
                 return True
             if not self._cached_bot:
-                await self._tellraw_private(sv, player, "绑定失败：机器人暂未缓存，请先在QQ发一条消息重试。")
+                await self._tellraw_private(
+                    sv, player,
+                    "绑定失败：机器人暂未缓存。请先在QQ侧给机器人随便发一条消息（私聊或任意群里都可），再重试。"
+                )
                 return True
             token = f"bind_{int(time.time()*1000)}_{abs(hash((mid,qq))) % 1000000:06d}"
             timeout_at = time.time() + int(self.config.get("BIND_CONFIRM_TIMEOUT", 300))
@@ -773,31 +827,62 @@ class MCBridgePlugin(Star):
                 f"拒绝请回复：拒绝 / 否 / n / cancel"
             )
             ok_private = False
+            private_err = ""
             try:
                 ok_private = await asyncio.wait_for(self._qq_send_private(qq, ask_prompt), timeout=6.0)
-            except Exception:
+            except Exception as e:
                 ok_private = False
+                private_err = f"{type(e).__name__}: {e}"
             if ok_private:
-                await self._tellraw_private(sv, player, f"已向 QQ {qq} 发送绑定确认，请对方私聊回复「同意」。({int(self.config.get('BIND_CONFIRM_TIMEOUT',300))}秒内有效)")
+                await self._tellraw_private(
+                    sv, player,
+                    f"✅ [私聊通道] 已向 QQ {qq} 发送绑定确认，请对方私聊回复「同意」。"
+                    f"({int(self.config.get('BIND_CONFIRM_TIMEOUT', 300))}秒内有效)"
+                )
             else:
                 # 2) 失败则找共同群，群@确认
                 groups = await self._qq_groups_of_user(qq)
                 sent = False
+                sent_group = ""
+                group_err_list: list[str] = []
                 for g in groups:
                     txt = (
                         f"[CQ:at,qq={qq}] "
                         f"【MC绑定二次确认】{display or player} [{sv.name}] 请求与你绑定。\n"
                         f"同意/是/y 或 拒绝/否/n 以完成。"
                     )
-                    if await self._qq_send_to_group(g, txt):
-                        self._pending_binds[token]["group_id"] = g
-                        sent = True
-                        break
+                    try:
+                        if await self._qq_send_to_group(g, txt):
+                            self._pending_binds[token]["group_id"] = g
+                            sent = True
+                            sent_group = g
+                            break
+                    except Exception as e2:
+                        group_err_list.append(f"群{g}:{type(e2).__name__}")
                 if sent:
-                    await self._tellraw_private(sv, player, f"已在共同群聊 @QQ {qq}，请对方回复确认。")
+                    await self._tellraw_private(
+                        sv, player,
+                        f"✅ [共同群通道] 已在群 {sent_group} @QQ {qq}，请对方回复「同意/是/y」确认。"
+                    )
                 else:
                     self._pending_binds.pop(token, None)
-                    await self._tellraw_private(sv, player, f"无法联系到QQ {qq}（没有共同群/非好友），请先添加机器人或加入共同群。")
+                    # 给玩家一个完整诊断：私聊失败原因 + 共同群数量 + 建议
+                    diag_parts = [f"❌ 无法联系到 QQ {qq}。"]
+                    if private_err:
+                        diag_parts.append(f"私聊失败：{private_err}")
+                    diag_parts.append(
+                        f"找到共同群 {len(groups)} 个（{len(group_err_list)} 个群发送出错）。"
+                    )
+                    diag_parts.append(
+                        "解决方法：① 先把机器人加成 QQ 好友，再重试；② 或把机器人拉到你所在的一个 QQ 群里，再重试。"
+                    )
+                    diag_parts.append("注：机器人必须先收到过一条 QQ 消息（私聊/群里都可）才能发送，请确认。")
+                    await self._tellraw_private(sv, player, "  ".join(diag_parts))
+                    logger.warning(
+                        f"[MCBridge][{sv.name}] /bind 联系QQ{qq} 完全失败："
+                        f"私聊err={private_err or 'ok_private=False/API静默失败'} "
+                        f"共同群数量={len(groups)} 群发送错误={group_err_list!r}"
+                    )
             return True
 
         # ----- /ai <自然语言> -----
