@@ -1,7 +1,7 @@
 name: astrbot_plugin_mc_bridge
 display_name: MC服务器桥接
-desc: 支持多台本地/远程 Minecraft(Paper/Spigot) 服务器接入，将玩家聊天记录为按服隔离的虚拟群聊会话；正版验证服可基于正版UUID跨服合并记忆/印象/上下文。支持同步到 memory_companion 与 交互印象(impression) 插件。管理员可通过 AstrBot 自然语言 LLM工具 或 /mc 指令执行 MC 管理/操作/查询/运维四类命令。支持桥接HTTP与RCON双通道回传 tellraw。
-version: 2.0.0
+desc: 支持多台本地/远程 Minecraft(Paper/Spigot) 服务器接入；正版UUID跨服合并记忆/印象/上下文；QQ全量消息与MC消息双向互通，共享 memory_companion / impression 全部记忆池（MC视为独立虚拟会话）；玩家可用 /bind 命令与QQ号绑定(需QQ真人二次确认)，权限跟随绑定的QQ号等级；MC内支持 /ai 前缀或自然语言意图让LLM执行MC指令（危险指令由LLM生成拒绝并提示用直接指令）；管理员可通过 AstrBot 自然语言LLM工具 或 /mc 指令执行 MC 管理/操作/查询/运维。支持bridge HTTP与RCON双通道回传tellraw。
+version: 3.0.0
 author: uGmTEAM
 repo: ""
 tags:
@@ -13,4 +13,7 @@ tags:
   - memory_companion
   - impression
   - 多服务器
+  - QQ互通
+  - 身份绑定
+  - 自然语言指令
 astrbot_version: ">=4.5.7"

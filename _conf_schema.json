@@ -67,6 +67,12 @@
                         "type": "string",
                         "default": "§7<{BOT_NAME}> {message}"
                     },
+                    "tellraw_private_template": {
+                        "description": "私聊tellraw模板",
+                        "hint": "私信/回执/错误回复用的模板，含 {BOT_NAME} 和 {message}，默认 §a<{BOT_NAME}> {message}",
+                        "type": "string",
+                        "default": "§a<{BOT_NAME}> {message}"
+                    },
                     "trigger_keywords": {
                         "description": "触发关键词",
                         "hint": "玩家消息含任一关键词即触发 LLM 回复。多个用英文逗号分隔，如 Kei,机器人,小樱",
@@ -107,20 +113,51 @@
             }
         }
     },
+    "FORWARD_GROUPS": {
+        "description": "【消息桥】MC→QQ 转发绑定。每条对应一条「某QQ群订阅某MC服务器聊天」的关系。管理员也可以在 QQ 群内发 /mc_forward on|off <服名> 动态添加或删除，无需改配置。",
+        "type": "template_list",
+        "hint": "点击「添加」新增一个转发绑定。例：群号 123456789 + 服务器 survival → MC生存服聊天会同步发到该群",
+        "templates": {
+            "forward_template": {
+                "name": "QQ群转发",
+                "items": {
+                    "group_id": {
+                        "description": "QQ群号",
+                        "hint": "接收MC聊天的QQ群，纯数字",
+                        "type": "string",
+                        "default": ""
+                    },
+                    "server_name": {
+                        "description": "订阅的MC服务器名",
+                        "hint": "订阅哪台服的聊天（对应SERVERS里的server_name）。填 * 表示订阅所有服",
+                        "type": "string",
+                        "default": "*"
+                    }
+                }
+            }
+        }
+    },
     "ASTRBOT_LISTEN_HOST": {"description": "【连接】AstrBot端HTTP接收服务绑定的主机IP。默认0.0.0.0全网卡监听；同机部署可改为127.0.0.1增强安全", "type": "string", "default": "0.0.0.0"},
     "SUPER_ADMIN_IDS": {"description": "【权限】超级管理员ID列表(逗号分隔QQ号/AstrBot平台用户ID)，拥有全部MC指令执行权限(含风险游戏操作类)", "type": "text", "default": ""},
     "ADMIN_CAN_QUERY_ONLY": {"description": "【权限】PermissionType.ADMIN群管是否可执行查询类+插件运维类(禁用则仅SUPER_ADMIN能做任何MC指令)", "type": "bool", "default": true},
-    "ENABLE_NATURAL_LANGUAGE_TOOL": {"description": "【权限】是否注册LLM自然语言工具(管理员用自然语言意图触发MC命令)；关闭后仅/mc命令可用", "type": "bool", "default": true},
+    "ENABLE_NATURAL_LANGUAGE_TOOL": {"description": "【权限】是否注册AstrBot侧LLM自然语言工具(管理员用自然语言意图触发MC命令)；关闭后仅/mc命令可用", "type": "bool", "default": true},
     "CMD_CONFIRMATION_REQUIRED": {"description": "【权限】玩家管理类/游戏操作类执行前，是否要求AstrBot管理员发送二次确认消息(确认/是/y/好)，确认后才执行", "type": "bool", "default": false},
     "CMD_EXECUTE_TIMEOUT": {"description": "【权限】二次确认超时时间(秒)，超时自动取消", "type": "int", "default": 120},
     "ENABLE_CROSS_SERVER_PUNISH": {"description": "【处罚联动】启用正版服之间处罚跨服联动：踢/禁言/白名单时在所有online_mode=true的服务器同步执行", "type": "bool", "default": true},
     "ENABLE_LLM_REPLY": {"description": "【回复·总开关】是否启用LLM回复被触发的玩家消息", "type": "bool", "default": true},
-    "LLM_REPLY_COOLDOWN": {"description": "【回复】LLM回复同服同一玩家的冷却时间(秒)，0=不限", "type": "int", "default": 3},
-    "MAX_HISTORY_PER_SERVER": {"description": "【会话】每台服务器虚拟会话保留的最大消息条数", "type": "int", "default": 300},
-    "LLM_CONTEXT_COUNT": {"description": "【会话】调用LLM时携带的近期消息条数(本服务器)", "type": "int", "default": 20},
+    "LLM_REPLY_COOLDOWN": {"description": "【回复】普通LLM聊天回复同服同一玩家的冷却时间(秒)，0=不限", "type": "int", "default": 3},
+    "MAX_HISTORY_PER_SERVER": {"description": "【会话】每台服务器/QQ群虚拟会话保留的最大消息条数", "type": "int", "default": 300},
+    "LLM_CONTEXT_COUNT": {"description": "【会话】调用LLM时携带的近期消息条数(本会话)", "type": "int", "default": 20},
     "ENABLE_CROSS_SERVER_CONTEXT": {"description": "【正版同步】开启正版验证(online_mode=true)且同一玩家在其他正版服有聊天时，LLM回复时补充读取那些服务器的近期消息作上下文", "type": "bool", "default": true},
-    "ENABLE_SYNC_TO_MEMORY_COMPANION": {"description": "【同步】是否将MC玩家聊天/触发回复事件同步到 memory_companion 伴侣插件", "type": "bool", "default": true},
-    "MEMORY_COMPANION_SYNC_INTERVAL": {"description": "【同步】每多少条消息批量同步一次到memory_companion(防刷)，1=每条即同步", "type": "int", "default": 5},
-    "ENABLE_SYNC_TO_IMPRESSION": {"description": "【同步】是否为MC玩家生成/更新交互印象(impression插件)；触发LLM回复或达到交互次数时更新", "type": "bool", "default": true},
-    "IMPRESSION_TRIGGER_COUNT": {"description": "【同步】MC玩家在同一服务器累计交互多少次，触发一次印象更新(LLM生成)", "type": "int", "default": 8}
+    "ENABLE_SYNC_TO_MEMORY_COMPANION": {"description": "【同步】是否将MC玩家+QQ聊天消息同步到 memory_companion 伴侣插件（写入短期timeline，让插件自动摘要提取长期记忆）", "type": "bool", "default": true},
+    "MEMORY_COMPANION_SYNC_INTERVAL": {"description": "【同步】每多少条消息批量同步一次到memory_companion(防刷)，1=每条即同步（MC与QQ共用此阈值）", "type": "int", "default": 5},
+    "ENABLE_SYNC_TO_IMPRESSION": {"description": "【同步】是否为玩家生成/更新交互印象(impression插件)；触发LLM回复或达到交互次数时更新（MC/QQ共用此阈值）", "type": "bool", "default": true},
+    "IMPRESSION_TRIGGER_COUNT": {"description": "【同步】同一用户累计交互多少次，触发一次印象更新(LLM生成)（MC/QQ共用此阈值）", "type": "int", "default": 8},
+    "CMD_NL_COOLDOWN": {"description": "【指令】MC玩家自然语言/ai指令的独立冷却时间(秒)，防止快速连续执行。普通聊天回复不共用此冷却。", "type": "int", "default": 15},
+    "ENABLE_NL_COMMAND_AUTO_DETECT": {"description": "【指令】MC玩家正常聊天消息里，是否自动识别指令意图（不强制/ai前缀，绑定玩家才能用）。危险指令会由LLM生成拒绝并提示用直接指令。关闭后必须 /ai <内容> 才会被当作指令。", "type": "bool", "default": true},
+    "ENABLE_MC_NL_COMMAND": {"description": "【指令】是否启用MC内自然语言指令通道。关闭后玩家只能走MC端插件/ai 前缀命令或 AstrBot /mc 命令。", "type": "bool", "default": true},
+    "ENABLE_FORWARD_MC_TO_QQ": {"description": "【消息桥】总开关：是否把MC玩家聊天按 FORWARD_GROUPS + /mc_forward 动态订阅转发到QQ群。关闭后记忆仍同步，只是不发群消息。", "type": "bool", "default": true},
+    "BIND_CONFIRM_TIMEOUT": {"description": "【绑定】玩家执行 /bind <QQ号> 后，等待QQ方真人确认的超时时间(秒)。超时自动取消绑定请求。", "type": "int", "default": 300},
+    "FORWARD_FMT_MC_TO_QQ": {"description": "【消息桥】MC聊天转发到QQ群的文本格式。占位符: {server}=服名, {player}=玩家ID, {display}=显示名, {message}=消息正文, {time}=HH:MM:SS", "type": "string", "default": "[MC|{server}] <{display}> {message}"},
+    "FORWARD_FMT_QQ_TO_MC": {"description": "【消息桥】QQ群消息同步进MC记忆时的来源标签。占位符: {group}=群号, {group_name}=群名, {sender}=昵称, {qq}=QQ号, {message}=正文", "type": "string", "default": "[QQ群{group}] <{sender}> {message}"}
 }

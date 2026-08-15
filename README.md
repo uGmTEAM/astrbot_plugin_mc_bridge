@@ -88,7 +88,15 @@ user:mcs[uuid:<玩家正版UUID>].<玩家名>
 | ENABLE_SYNC_TO_MEMORY_COMPANION | bool | `true` | 是否将 MC 聊天/回复事件同步到 memory_companion。 |
 | MEMORY_COMPANION_SYNC_INTERVAL | int | `5` | 每积累多少条消息批量同步一次到 memory_companion（防止刷屏）。1 = 每条立即同步。 |
 | ENABLE_SYNC_TO_IMPRESSION | bool | `true` | 是否为 MC 玩家生成/更新交互印象(impression插件)。 |
-| IMPRESSION_TRIGGER_COUNT | int | `8` | MC 玩家累计交互多少次，触发一次印象 LLM 更新。 |
+| IMPRESSION_TRIGGER_COUNT | int | `8` | MC 玩家累计交互多少次，触发一次印象 LLM 更新。QQ 聊天同样共用此阈值。 |
+| **FORWARD_GROUPS** | template_list | — | **【消息桥】MC→QQ 静态转发绑定**。每条对应一个「某QQ群订阅某MC服务器聊天」。也支持在 QQ 群内动态 `/mc_forward on|off`。 |
+| FORWARD_FMT_MC_TO_QQ | string | `[MC\|{server}] <{display}> {message}` | MC→QQ 转发的文本格式；占位符 `{server}/{player}/{display}/{message}/{time}`。 |
+| FORWARD_FMT_QQ_TO_MC | string | `[QQ群{group}] <{sender}> {message}` | QQ消息写入共享记忆时的"来源标签"文本；占位符 `{group}/{group_name}/{sender}/{qq}/{message}`。 |
+| ENABLE_FORWARD_MC_TO_QQ | bool | `true` | 【消息桥总开关】是否把 MC 聊天按 FORWARD_GROUPS + `/mc_forward` 动态订阅转发到 QQ 群。关闭后记忆仍同步，只是不发群消息。 |
+| **CMD_NL_COOLDOWN** | int | `15` | MC 玩家自然语言指令（`/ai` 前缀或自动识别）的独立冷却时间(秒)。注意：普通聊天回复走 `LLM_REPLY_COOLDOWN`，两者不共用。 |
+| ENABLE_MC_NL_COMMAND | bool | `true` | MC 侧自然语言指令总开关。关闭后 `/ai` 和自动识别都会被禁用，玩家只能用游戏内直接命令 或 AstrBot 侧 `/mc`。 |
+| ENABLE_NL_COMMAND_AUTO_DETECT | bool | `true` | MC 玩家正常聊天消息里是否自动识别「指令意图」。关闭后必须显式 `/ai <内容>` 才进入指令模式。危险指令会由 LLM 生成拒绝并提示「请直接用指令」。 |
+| BIND_CONFIRM_TIMEOUT | int | `300` | MC 内 `/bind <QQ号>` 后，QQ 真人二次确认的超时时间(秒)。超时自动取消绑定请求。 |
 
 ### 4.2 SERVERS —— 可视化表单配置（template_list）
 
@@ -111,7 +119,8 @@ user:mcs[uuid:<玩家正版UUID>].<玩家名>
 | RCON端口 (`mc_rcon_port`) | int | `25575` | `send_channel=rcon` 时用。 |
 | RCON密码 (`mc_rcon_password`) | string | `""` | `send_channel=rcon` 时用。 |
 | 机器人显示名 (`bot_name`) | string | `Kei` | 本服机器人名字，tellraw 模板里 `{BOT_NAME}` 替换为此值。 |
-| tellraw消息模板 (`tellraw_template`) | string | `§7<{BOT_NAME}> {message}` | 支持 `{BOT_NAME}` 和 `{message}` 占位符，支持 `§` 颜色代码。 |
+| tellraw消息模板 (`tellraw_template`) | string | `§7<{BOT_NAME}> {message}` | **全服tellraw**模板，支持 `{BOT_NAME}` 和 `{message}` 占位符，支持 `§` 颜色代码。普通 LLM 聊天回复走这个模板。 |
+| 私聊tellraw模板 (`tellraw_private_template`) | string | `§a<{BOT_NAME}> {message}` | **私信tellraw**模板，支持 `{BOT_NAME}` 和 `{message}`。指令回执/错误/绑定提示等只发给某个玩家的消息走此模板。发送命令格式为 `tellraw [玩家名] {"text":"<botname>消息内容"}`。 |
 | 触发关键词 (`trigger_keywords`) | string | `Kei,机器人` | 玩家消息含任一关键词即触发 LLM 回复。**多个用英文逗号分隔**。 |
 | 启用@触发 (`enable_at_trigger`) | bool | `true` | 玩家消息以 `@机器人名` 或 `机器人名` 开头时触发回复。 |
 | 正版验证 (`online_mode`) | bool | `false` | 建议不手动填。MC 端启动握手会自动用 `Bukkit.getOnlineMode()` 覆盖此值。 |
@@ -251,6 +260,115 @@ rcon.password=MyRconPasswd!!
 | `mc_plugin_ops` | "查MC桥接插件版本" / "把所有服的记忆重新同步一下" |
 
 > 提示：LLM 在调用 `mc_player_manage` / `mc_game_operation` 前会先查看自己有没有权限；无权时会提示你需要 SUPER_ADMIN。
+
+---
+
+### 5.4 v3.0 新增一：QQ 全消息互通 / 记忆印象共享
+
+从 v3.0 起，插件会以**旁路旁听**（priority=30，`@filter.event_message_type(ALL)`）的方式记录所有 QQ 群和私聊消息，但**不会拦截或屏蔽**任何正常机器人的回复。
+
+**工作方式：**
+
+- 每一个 QQ 群/私聊 都会被当作一个独立的「虚拟会话」记录下来（类似 MC 服务器的虚拟会话），滚动保留 `MAX_HISTORY_PER_SERVER` 条。
+- QQ 消息按 `FORWARD_FMT_QQ_TO_MC` 的格式写入 `memory_companion` 的短期 timeline，随后让伴侣插件自动提取长期记忆。**这样 LLM 无论在 MC 里还是 QQ 里回复，都能通过 `bridge.search / compose_context` 检索到跨平台的共享记忆**。
+- 印象同步：QQ 用户的 `user:<QQ号>` 就是 impression 插件的身份主键，与 impression 插件的 `_get_key()` 完全一致，实现跨 MC/QQ 共用同一份印象。
+- CQ 码会被自动剥离（`[CQ:at,qq=...]` 会保留成 `@QQ号`，`[CQ:reply,id=...]` 引用回复会被记录到会话内 `reply_to_id` 字段）。
+- 若消息是 AstrBot 命令（`/mc /mc_bridge /mc_confirm /mc_forward /mc_bindings /unbind`），不会被写入聊天记忆，避免污染。
+
+**会话 ID 策略（会话隔离但记忆共享）：**
+
+| 来源 | session_id 形式 |
+|:-----|:----------------|
+| MC 服 survival | `mcbridge:GroupMessage:mc_survival` |
+| QQ 群 123456789 | `aiocqhttp:GroupMessage:123456789` |
+| QQ 私聊 987654321 | `aiocqhttp:FriendMessage:987654321` |
+
+> 不同来源的会话是隔离的（MC的上下文不会直接塞进QQ的上下文回显里），但**长期记忆、印象完全共用同一份**（只要身份一致/绑定过）。
+
+---
+
+### 5.5 v3.0 新增二：身份绑定（MC 玩家 ↔ QQ 号）
+
+绑定后同一用户在 MC 和 QQ 的**记忆、印象、指令权限**三者完全合并。
+
+#### MC 侧操作
+
+玩家在 Minecraft 里执行：
+
+```
+/bind <QQ号>        # 申请与该QQ号绑定，插件会联系QQ真人二次确认
+/unbind             # 解除当前MC身份的绑定
+/ai <自然语言>      # 显式以"自然语言指令"模式让机器人执行(绑定后)
+```
+
+- 申请 `/bind` 后，插件会**优先私聊**目标QQ号发二次确认；私聊失败时会找机器人和目标的**共同群**群 @ 确认。
+- QQ 真人在 **BIND_CONFIRM_TIMEOUT 秒内**回复 `同意 / 确认 / 是 / y / 好` 任一即绑定成功；反之 `拒绝 / 否 / n / cancel` 则拒绝。
+- 结果会以 `tellraw [玩家名] <[botname]> {结果}` 的形式**私信 tellraw** 回给申请的玩家。
+
+#### QQ 侧操作
+
+```
+/unbind             # 本人解绑自己的MC↔QQ绑定
+/mc_bindings        # (ADMIN+) 查看所有绑定
+/mc_forward on|off <服名或*>   # (ADMIN+) 群内订阅/取消订阅某MC服聊天
+```
+
+#### 身份主键（key）对应关系
+
+| 场景 | user_key（记忆/印象主键） |
+|:-----|:------------------------|
+| QQ 用户 123456789 | `user:123456789` |
+| 未绑定的正版MC玩家 | `user:mcs[uuid:069a79f4...].Steve` |
+| 未绑定的非正版MC玩家(survival服) | `user:mcs[survival].Steve` |
+| **绑定后的MC玩家** | **与绑定QQ完全相同 `user:<QQ号>`**（实现跨MC/QQ互通） |
+
+#### 权限映射
+
+执行 MC 管理命令（或 MC 内自然语言指令）时权限跟随绑定的 QQ 号等级：
+
+| 绑定QQ等级 | 可执行 |
+|:----------|:-------|
+| SUPER_ADMIN_IDS | `query / op / risk / gameop` 全权限 |
+| PermissionType.ADMIN | `query` 查询 + `op` 运维 (当 `ADMIN_CAN_QUERY_ONLY=true`) |
+| MEMBER 普通成员 | MC 内自然语言指令仅允许「安全自操作」类，其他会被 LLM 拒绝 |
+| 未绑定QQ的MC玩家 | 不能用「自然语言指令」功能，回复提示请先 `/bind <QQ号>` |
+
+> 注：`/mc` 系列 AstrBot 管理员命令仍按原有规则走（无需绑定）。
+
+---
+
+### 5.6 v3.0 新增三：MC 自然语言指令（/ai 前缀 + 自动意图识别）
+
+绑定玩家在 MC 里可以两种方式让机器人帮你执行指令：
+
+- **强制模式**：`/ai <自然语言>` → 一定会把你的话当指令解析。
+- **自动模式**：聊天消息里如果 LLM 判定「这是个指令意图」，也会按指令执行（可通过 `ENABLE_NL_COMMAND_AUTO_DETECT=false` 关闭）。
+
+**安全分级：**
+- ✅ **安全查询类（/list /help /tps /me /say /tp自己 /weather /time 等）**：会直接帮你执行，输出用 `tellraw [玩家名] <[botname]> {内容}` 的形式**私信 tellraw** 回给你。
+- ❌ **危险指令（kick/ban/pardon/op/deop/whitelist/gamemode/give/setblock/fill/summon/clear/stop/restart/effect/raw 等）**：LLM 会生成一句自然语言**拒绝语**并提示你「请直接使用游戏内命令（非自然语言）」。这类高风险操作请使用 AstrBot 管理员的 `/mc` 命令或 LLM 工具调用（需要 SUPER_ADMIN + 二次确认）。
+
+**独立冷却：**
+- `CMD_NL_COOLDOWN`（默认 15 秒）是自然语言指令专用冷却，与普通 LLM 聊天回复 `LLM_REPLY_COOLDOWN`（默认 3 秒）**互不共用**。
+- `/ai <内容>` 的内容如果被判定为「不是指令」，会直接告诉你识别失败，不会额外去触发全服 LLM 闲聊回复。
+
+---
+
+### 5.7 v3.0 新增四：/mc_forward 消息桥动态订阅
+
+有两种方式让 QQ 群订阅 MC 聊天：
+
+1. **静态配置**：在 AstrBot WebUI 的 `FORWARD_GROUPS`（template_list）里一条条加好。
+2. **动态订阅**：ADMIN 权限的群管直接在 QQ 群里发命令即可，不需要改配置：
+
+```
+/mc_forward on  <服名或*>        # 本群开始订阅某台服聊天；* = 所有服
+/mc_forward off <服名或*>        # 取消订阅
+```
+
+- MC→QQ 的文本格式可通过 `FORWARD_FMT_MC_TO_QQ` 自定义。
+- 总开关：`ENABLE_FORWARD_MC_TO_QQ=false` 时完全不转发任何消息，但记忆/印象同步照常进行。
+- 消息桥的"对端 QQ 机器人"引用来自最近一次由 AstrBot 接收的 QQ 消息事件里缓存的 bot；所以**首次使用前请先在 QQ 里给机器人发一条任意消息**，让插件成功缓存 bot 引用。
 
 ---
 
