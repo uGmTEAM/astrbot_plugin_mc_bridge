@@ -116,8 +116,9 @@ class ServerCfg:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ServerCfg":
+        name = str(d.get("server_name", d.get("name", "")) or "").strip()
         return cls(
-            name=str(d.get("name", "")).strip(),
+            name=name,
             host=str(d.get("host", "127.0.0.1") or "127.0.0.1").strip(),
             listen_port=int(d.get("listen_port", 6188)),
             bridge_token=str(d.get("bridge_token", "") or ""),

@@ -2,57 +2,56 @@
     "SERVERS": {
         "description": "【多服务器·核心】MC服务器配置列表",
         "type": "template_list",
-        "hint": "点击「添加」新增一台MC服务器。每台服务器独立配置监听端口、回传通道、机器人名等。server_name 必须与 MC 端 config.yml 的 server_name 一致。",
+        "hint": "点击「添加」新增一台MC服务器。每台服务器独立配置监听端口、回传通道、机器人名等。服务器名称必须与 MC 端 config.yml 的 server_name 一致。",
         "templates": {
             "server_template": {
                 "name": "MC服务器",
                 "items": {
-                    "name": {
+                    "server_name": {
                         "description": "服务器名称",
-                        "hint": "唯一标识，必须与MC端 config.yml 的 server_name 一致。玩家标签格式: mcs[名称].玩家名",
+                        "hint": "唯一标识，必须与 MC 端 config.yml 的 server_name 一致。玩家标签格式 mcs[名称].玩家名",
                         "type": "string",
                         "default": "survival"
                     },
                     "host": {
                         "description": "MC服务器IP",
-                        "hint": "本插件向该服回传 tellraw 时连接的IP。同机部署填 127.0.0.1",
+                        "hint": "本插件向该服回传 tellraw 时连接的 IP。同机部署填 127.0.0.1",
                         "type": "string",
                         "default": "127.0.0.1"
                     },
                     "listen_port": {
                         "description": "AstrBot监听端口",
-                        "hint": "本插件为该服务器独占的HTTP监听端口，每台服必须不同（如6188、6189...）",
+                        "hint": "本插件为该服务器独占的 HTTP 监听端口。每台服必须不同，如 6188、6189",
                         "type": "int",
                         "default": 6188
                     },
                     "bridge_token": {
                         "description": "鉴权Token",
-                        "hint": "与MC端 bridge_token 填一致，为空则不鉴权。生产环境务必设置",
+                        "hint": "与 MC 端 bridge_token 填一致，为空则不鉴权。生产环境务必设置",
                         "type": "string",
                         "default": ""
                     },
                     "send_channel": {
                         "description": "回传通道",
-                        "hint": "bridge=走MC端插件HTTP（需装McAstrbotBridge.jar），rcon=走原生RCON（需MC端开启rcon）",
+                        "hint": "填 bridge 或 rcon。bridge 走 MC 端插件 HTTP；rcon 走原生 RCON",
                         "type": "string",
-                        "default": "bridge",
-                        "options": ["bridge", "rcon"]
+                        "default": "bridge"
                     },
                     "mc_bridge_port": {
                         "description": "MC端HTTP端口",
-                        "hint": "send_channel=bridge 时用，对应MC端 bridge_listen_port（默认25580）",
+                        "hint": "send_channel=bridge 时用，对应 MC 端 bridge_listen_port，默认 25580",
                         "type": "int",
                         "default": 25580
                     },
                     "mc_rcon_port": {
                         "description": "RCON端口",
-                        "hint": "send_channel=rcon 时用，对应MC端 server.properties 的 rcon.port（默认25575）",
+                        "hint": "send_channel=rcon 时用，对应 MC 端 rcon.port，默认 25575",
                         "type": "int",
                         "default": 25575
                     },
                     "mc_rcon_password": {
                         "description": "RCON密码",
-                        "hint": "send_channel=rcon 时用，对应MC端 rcon.password",
+                        "hint": "send_channel=rcon 时用，对应 MC 端 rcon.password",
                         "type": "string",
                         "default": ""
                     },
@@ -64,25 +63,25 @@
                     },
                     "tellraw_template": {
                         "description": "tellraw消息模板",
-                        "hint": "支持 {BOT_NAME} 和 {message} 占位符，支持 § 颜色代码",
+                        "hint": "支持 {BOT_NAME} 和 {message} 两个占位符，可用 § 颜色代码",
                         "type": "string",
                         "default": "§7<{BOT_NAME}> {message}"
                     },
                     "trigger_keywords": {
                         "description": "触发关键词",
-                        "hint": "玩家消息含任一关键词即触发LLM回复。多个用英文逗号分隔，如: Kei,机器人,小樱",
+                        "hint": "玩家消息含任一关键词即触发 LLM 回复。多个用英文逗号分隔，如 Kei,机器人,小樱",
                         "type": "string",
                         "default": "Kei,机器人"
                     },
                     "enable_at_trigger": {
                         "description": "启用@触发",
-                        "hint": "玩家消息以 @{bot_name} 或 {bot_name} 开头时触发回复",
+                        "hint": "玩家消息以 @机器人名 或 机器人名 开头时是否触发回复",
                         "type": "bool",
                         "default": true
                     },
                     "online_mode": {
                         "description": "正版验证",
-                        "hint": "建议不手动填。MC端启动握手会自动用 Bukkit.getOnlineMode() 覆盖此值",
+                        "hint": "建议不手动填。MC 端启动握手会自动用 Bukkit.getOnlineMode() 覆盖此值",
                         "type": "bool",
                         "default": false
                     },
