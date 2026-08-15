@@ -426,29 +426,55 @@ class MCBridgePlugin(Star):
         is_command = bool(data.get("is_command", False))
         if not player or not message:
             return web.json_response({"ok": False, "error": "missing player/message"}, status=400)
-        # 把消息处理包一个顶层 try/catch：任何异常都会回 tellraw 给玩家，避免"命令没下文"
-        # 命令事件（/bind/unbind/ai）强制回执；聊天事件只在顶层异常时告知
-        self._spawn(
-            self._mc_message_safe_wrapper_wait(
-                sv, player, display, message, int(ts), player_uuid, server_name_report, is_command
-            )
-        )
-        # 关键：对于命令事件，等待 _on_mc_message 里所有 tellraw_private 入队完成后，
-        # 再一次性取 pending_messages 回给 Java 端 —— 但为了不阻塞 HTTP 响应太久，
-        # 我们在这里先给一个小窗口等待（最多 300ms）取出刚刚入队的回执。
-        pending: list[dict] = []
+
+        # ------------------------------------------------------------------
+        # 关键修复：命令事件（/bind /unbind /ai）改为同步 await 处理，不再 _spawn 后台
+        # 否则 _handle_mc_chat 只等 0.3s 就去 dequeue，而绑定流程（私聊2.5s+群遍历）远没完成，
+        # pending 队列必然为空 → Java 端拿不到 pending_messages[] → 玩家"没下文"。
+        # 总超时 3.8s（小于 Java 端 read_timeout=5s），到点强制取消并塞一条"处理中"pending 回执。
+        # ------------------------------------------------------------------
         if is_command:
+            started = time.time()
             try:
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
-            pending = await self._dequeue_pending_replies(sv.name, player)
-        # 附带：聊天消息也把之前残留的 pending 顺带带回去（避免之前命令的pending要等下一条命令才出）
-        if not pending:
-            pending = await self._dequeue_pending_replies(sv.name, player)
+                await asyncio.wait_for(
+                    self._mc_message_safe_wrapper_sync(
+                        sv, player, display, message, int(ts), player_uuid, server_name_report, True
+                    ),
+                    timeout=3.8,
+                )
+            except asyncio.TimeoutError:
+                # 超时（大概率在 _qq_send_private 等待 OneBot 返回 / 或在发群消息）：
+                # 告诉玩家"提交成功，稍后留意私聊/共同群"，后台继续跑完
+                self._spawn(
+                    self._mc_message_safe_wrapper_silent(
+                        sv, player, display, message, int(ts), player_uuid, server_name_report
+                    )
+                )
+                msg = (
+                    "🔄 请求已提交到 AstrBot。若 15 秒后 MC 内还是没收到回执且 QQ 私聊/群里也没收到"
+                    f"机器人@你，请检查：AstrBot 端 host={sv.host!r} mc_bridge_port={sv.mc_bridge_port} "
+                    f"bridge_token 是否与 MC 端 config.yml 一致；或 AstrBot 是否先收到过一条 QQ 消息激活机器人。"
+                )
+                await self._enqueue_pending_reply(sv.name, player, msg, "info")
+            except Exception as e:
+                logger.exception(f"[MCBridge][{sv.name}] 同步处理命令异常: player={player} msg={message!r}")
+                await self._enqueue_pending_reply(
+                    sv.name, player,
+                    f"[Bridge 内部错误：{type(e).__name__}] 请管理员查看 AstrBot 日志",
+                    "error",
+                )
+        else:
+            # 聊天消息仍用后台执行（没必要同步阻塞 HTTP）；先前残留的 pending 也会被带回去
+            self._spawn(
+                self._mc_message_safe_wrapper_silent(
+                    sv, player, display, message, int(ts), player_uuid, server_name_report
+                )
+            )
+
+        # 统一取出 pending（同步处理已经入队了）
+        pending = await self._dequeue_pending_replies(sv.name, player)
         resp_body = {"ok": True}
         if pending:
-            # 简化给 Java 端的字段：level 转成颜色前缀即可
             simplified: list[dict] = []
             for p in pending:
                 level = str(p.get("level", "info") or "info")
@@ -464,19 +490,20 @@ class MCBridgePlugin(Star):
             resp_body["pending_messages"] = simplified
         return web.json_response(resp_body)
 
-    async def _mc_message_safe_wrapper_wait(
-        self,
-        sv: ServerCfg,
-        player: str,
-        display: str,
-        message: str,
-        ts: int,
-        player_uuid: str,
-        reported_srv: str,
-        is_command: bool,
+    async def _mc_message_safe_wrapper_sync(
+        self, sv, player, display, message, ts, player_uuid, reported_srv, is_command
     ):
-        """和 _mc_message_safe_wrapper 语义一致：名字改一下避免与 _on_mc_message 命名混淆。"""
+        """同步版本：直接 await _on_mc_message，异常时走 tellraw_private（反向桥不通就入队 pending）。"""
         await self._mc_message_safe_wrapper(sv, player, display, message, ts, player_uuid, reported_srv, is_command)
+
+    async def _mc_message_safe_wrapper_silent(
+        self, sv, player, display, message, ts, player_uuid, reported_srv
+    ):
+        """后台静默版（已给玩家发过 🔄 处理中 的提示），跑完不再发同一条回执。只跑实际动作。"""
+        try:
+            await self._on_mc_message(sv, player, display, message, ts, player_uuid, reported_srv)
+        except Exception as e:
+            logger.exception(f"[MCBridge][{sv.name}] 后台静默处理MC消息异常: player={player} msg={message!r}")
 
     async def _mc_message_safe_wrapper(
         self,
@@ -938,7 +965,8 @@ class MCBridgePlugin(Star):
             ok_private = False
             private_err = ""
             try:
-                ok_private = await asyncio.wait_for(self._qq_send_private(qq, ask_prompt), timeout=6.0)
+                # 私聊超时从 6.0s 缩到 2.0s：保证 /bind 整体在 HTTP 3.8s wait_for 内得出结果
+                ok_private = await asyncio.wait_for(self._qq_send_private(qq, ask_prompt), timeout=2.0)
             except Exception as e:
                 ok_private = False
                 private_err = f"{type(e).__name__}: {e}"
@@ -954,14 +982,17 @@ class MCBridgePlugin(Star):
                 sent = False
                 sent_group = ""
                 group_err_list: list[str] = []
-                for g in groups:
+                for idx, g in enumerate(groups):
+                    # 每个群单条发送也设 1.5s 超时；超过 3 个群就 break（避免整体超时）
+                    if idx >= 3:
+                        break
                     txt = (
                         f"[CQ:at,qq={qq}] "
                         f"【MC绑定二次确认】{display or player} [{sv.name}] 请求与你绑定。\n"
                         f"同意/是/y 或 拒绝/否/n 以完成。"
                     )
                     try:
-                        if await self._qq_send_to_group(g, txt):
+                        if await asyncio.wait_for(self._qq_send_to_group(g, txt), timeout=1.5):
                             self._pending_binds[token]["group_id"] = g
                             sent = True
                             sent_group = g
