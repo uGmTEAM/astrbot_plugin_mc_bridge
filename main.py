@@ -376,30 +376,110 @@ class MCBridgePlugin(Star):
 
     async def _start_http_servers(self):
         host = str(self.config.get("ASTRBOT_LISTEN_HOST", "0.0.0.0") or "0.0.0.0").strip()
+        # 去重：同一个 listen_port 只启动一次 app，避免 AstrBot 插件热加载后重复监听同一个端口导致"Address already in use"
+        # （MC 端 config.yml 默认 astrbot_port=6188，用户多台服共用 AstrBot 监听一个端口也很常见）
+        # key = (host, port)；value = (app, runner, site)
+        started_sites: dict[tuple[str, int], tuple] = {}
+        # port -> list[sv_name]：一个 port 可能匹配多个服务器名，请求时根据 server_name_report 或 握手映射找 sv
+        self._port_to_svs: dict[int, list[ServerCfg]] = {}
+        # mc_identity / handshake 过来的上报 server_name -> ServerCfg（/mc_chat 请求里带 server_name 时能找到正确 sv）
+        self._name_to_sv: dict[str, ServerCfg] = {
+            s.name: s for s in self._servers.values()
+        }
+
+        def _attach_routes(app: web.Application, port: int):
+            """给某个 port 共用的 app 挂上三条路由，handler 内部再根据请求内容找对应 ServerCfg。"""
+            async def h_mc_chat(request):
+                # 先根据握手映射/report 匹配具体 server
+                try:
+                    data = await request.json()
+                except Exception:
+                    return web.json_response({"ok": False, "error": "bad json"}, status=400)
+                reported = str(data.get("server_name", "") or "").strip()
+                sv = None
+                if reported and reported in self._name_to_sv:
+                    sv = self._name_to_sv[reported]
+                if sv is None:
+                    # fallback：该 port 下挂的第一个服
+                    candidates = self._port_to_svs.get(port, [])
+                    if candidates:
+                        sv = candidates[0]
+                if sv is None:
+                    # 最后兜底：任意一个已知服（_check_token 会再过滤）
+                    sv = next(iter(self._servers.values()), None)
+                if sv is None:
+                    return web.json_response({"ok": False, "error": "no server cfg"}, status=503)
+                return await self._handle_mc_chat(request, sv)
+
+            async def h_mc_handshake(request):
+                candidates = self._port_to_svs.get(port, [])
+                sv = candidates[0] if candidates else next(iter(self._servers.values()), None)
+                if sv is None:
+                    return web.json_response({"ok": False, "error": "no server cfg"}, status=503)
+                resp = await self._handle_mc_handshake(request, sv)
+                # 握手成功后：如果上报了 server_name，建立 server_name -> 本 sv 的映射（即使和配置里 name 不同也 OK）
+                try:
+                    body = await request.json()
+                    reported = str((body or {}).get("server_name", "") or "").strip()
+                    if reported and reported not in self._name_to_sv:
+                        self._name_to_sv[reported] = sv
+                except Exception:
+                    pass
+                return resp
+
+            async def h_status(request):
+                candidates = self._port_to_svs.get(port, [])
+                sv = candidates[0] if candidates else next(iter(self._servers.values()), None)
+                if sv is None:
+                    return web.json_response({"ok": False, "error": "no server cfg"}, status=503)
+                return await self._handle_status(request, sv)
+
+            app.router.add_post("/mc_chat", h_mc_chat)
+            app.router.add_post("/mc_handshake", h_mc_handshake)
+            app.router.add_get("/status", h_status)
+            # 兜底：任何路径返回结构化 404，便于 Java 端快速识别"端口上不是我们的服务（比如 FastAPI 没有 /mc_chat）"
+            async def _catch_all(request):
+                return web.json_response({
+                    "ok": False,
+                    "error": f"mc_bridge: unknown path {request.path!r} (请检查 MC 端 astrbot_port 是否填对)",
+                    "hint": "正确路径: POST /mc_chat, POST /mc_handshake, GET /status",
+                }, status=404)
+            app.router.add_route("*", "/{tail:.*}", _catch_all)
+
         for sv in self._servers.values():
+            port_key = (host, sv.listen_port)
+            self._port_to_svs.setdefault(sv.listen_port, []).append(sv)
+            if port_key in started_sites:
+                # 此端口已被其他服共用 app，跳过，不必再启动
+                logger.info(
+                    f"[MCBridge] 服务器[{sv.name}] 复用已启动的 HTTP 监听 {host}:{sv.listen_port} "
+                    f"(共用 {len(self._port_to_svs[sv.listen_port])} 台服务器)"
+                )
+                continue
             app = web.Application()
-            # 捕获 listen_port -> 找到对应服务器配置，传参给 handler
-            sv_ref = sv
-            app.router.add_post(
-                "/mc_chat", lambda r, s=sv_ref: self._handle_mc_chat(r, s)
-            )
-            app.router.add_post(
-                "/mc_handshake", lambda r, s=sv_ref: self._handle_mc_handshake(r, s)
-            )
-            app.router.add_get(
-                "/status", lambda r, s=sv_ref: self._handle_status(r, s)
-            )
+            _attach_routes(app, sv.listen_port)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, host, sv.listen_port)
             try:
                 await site.start()
             except Exception as e:
+                # 致命：端口被别人占了 → 只打后台日志，不给玩家塞 pending（避免前台噪音）
                 logger.error(
-                    f"[MCBridge] 服务器[{sv.name}] HTTP 监听 :{sv.listen_port} 失败 (端口占用?): {e}"
+                    f"[MCBridge] 服务器[{sv.name}] HTTP 监听 {host}:{sv.listen_port} 失败: {e!r}. "
+                    f"**这会导致 MC 端所有命令(含/bind)看起来只有「正在处理」没有下文**！"
+                    f"解决：1) lsof -i :{sv.listen_port} 或 ss -tlnp | grep :{sv.listen_port} 找到占用进程并 kill；"
+                    f"2) 或者在 AstrBot 插件配置 SERVERS 里把 listen_port 改成未占用端口，并同步修改 MC 端 config.yml 的 astrbot_port。"
                 )
                 continue
             self._http_runners.append((runner, site, sv.listen_port))
+            started_sites[port_key] = (app, runner, site)
+        # 记录"哪些 listen_port 成功启动了"，供 _handle_mc_chat 快速检测端口占用场景
+        self._ports_ok: set[int] = set(port for (_, _, port) in self._http_runners)
+
+    async def _listen_port_ok(self, sv: ServerCfg) -> bool:
+        """判断该 sv 的 listen_port 是否处于成功启动状态（端口占用返回 False，玩家看到诊断）。"""
+        return bool(getattr(self, "_ports_ok", None) and sv.listen_port in self._ports_ok)
 
     async def _check_token(self, request, sv: ServerCfg) -> bool:
         token = (sv.bridge_token or "").strip()
@@ -426,6 +506,15 @@ class MCBridgePlugin(Star):
         is_command = bool(data.get("is_command", False))
         if not player or not message:
             return web.json_response({"ok": False, "error": "missing player/message"}, status=400)
+
+        # 🔴 最优先：sv.listen_port 自己没绑成功（被其他进程抢占）
+        # → 只打后台日志，不给玩家塞 pending（诊断放后台）
+        if not await self._listen_port_ok(sv):
+            logger.error(
+                f"[MCBridge][{sv.name}] listen_port :{sv.listen_port} 未成功启动(被占用)，"
+                f"MC端命令无法被正确接收。请 kill 占用进程或改端口。"
+            )
+            return web.json_response({"ok": False, "error": f"listen_port :{sv.listen_port} not started (port occupied)"})
 
         # ------------------------------------------------------------------
         # 关键修复：命令事件（/bind /unbind /ai）改为同步 await 处理，不再 _spawn 后台
