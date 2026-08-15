@@ -198,6 +198,15 @@ class MCBridgePlugin(Star):
         self._cached_bot: Optional[Any] = None
         self._cached_platform_id: str = ""
 
+        # --------- v3.1 新增：正向回传队列（解决"反向桥不通→玩家没下文"）---------
+        # key = server_name；value = list[ {player: str, msg: str, level: "info"|"error"|"success", ts: float} ]
+        # 如果 AstrBot → MC 的 bridge/rcon 回 tellraw 失败，就把回执塞进这里。
+        # 下一次 Java 端 POST /mc_chat 时，_handle_mc_chat 会取出匹配该服/该玩家的 pending，
+        # 通过 HTTP 响应体 pending_messages[] 一并带回 Java 端，由 Java 端直接 player.sendMessage 显示。
+        # 这保证了：无论反向桥通不通，命令都有"下文"。
+        self._reply_pending: dict[str, list[dict]] = {}
+        self._reply_pending_lock = asyncio.Lock()
+
         self._lock = asyncio.Lock()
         self._rcon_locks: dict[str, asyncio.Lock] = {}
         self._http_runners: list[tuple] = []  # (runner, site, port)
@@ -420,11 +429,54 @@ class MCBridgePlugin(Star):
         # 把消息处理包一个顶层 try/catch：任何异常都会回 tellraw 给玩家，避免"命令没下文"
         # 命令事件（/bind/unbind/ai）强制回执；聊天事件只在顶层异常时告知
         self._spawn(
-            self._mc_message_safe_wrapper(
+            self._mc_message_safe_wrapper_wait(
                 sv, player, display, message, int(ts), player_uuid, server_name_report, is_command
             )
         )
-        return web.json_response({"ok": True})
+        # 关键：对于命令事件，等待 _on_mc_message 里所有 tellraw_private 入队完成后，
+        # 再一次性取 pending_messages 回给 Java 端 —— 但为了不阻塞 HTTP 响应太久，
+        # 我们在这里先给一个小窗口等待（最多 300ms）取出刚刚入队的回执。
+        pending: list[dict] = []
+        if is_command:
+            try:
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+            pending = await self._dequeue_pending_replies(sv.name, player)
+        # 附带：聊天消息也把之前残留的 pending 顺带带回去（避免之前命令的pending要等下一条命令才出）
+        if not pending:
+            pending = await self._dequeue_pending_replies(sv.name, player)
+        resp_body = {"ok": True}
+        if pending:
+            # 简化给 Java 端的字段：level 转成颜色前缀即可
+            simplified: list[dict] = []
+            for p in pending:
+                level = str(p.get("level", "info") or "info")
+                prefix = {
+                    "error": "§c[Bridge] ",
+                    "success": "§a[Bridge] ",
+                    "info": "§7[Bridge] ",
+                }.get(level, "§7[Bridge] ")
+                simplified.append({
+                    "text": f"{prefix}{p.get('msg', '')}",
+                    "level": level,
+                })
+            resp_body["pending_messages"] = simplified
+        return web.json_response(resp_body)
+
+    async def _mc_message_safe_wrapper_wait(
+        self,
+        sv: ServerCfg,
+        player: str,
+        display: str,
+        message: str,
+        ts: int,
+        player_uuid: str,
+        reported_srv: str,
+        is_command: bool,
+    ):
+        """和 _mc_message_safe_wrapper 语义一致：名字改一下避免与 _on_mc_message 命名混淆。"""
+        await self._mc_message_safe_wrapper(sv, player, display, message, ts, player_uuid, reported_srv, is_command)
 
     async def _mc_message_safe_wrapper(
         self,
@@ -571,19 +623,22 @@ class MCBridgePlugin(Star):
     async def _tellraw_broadcast(self, sv: ServerCfg, message: str):
         """全服 tellraw（普通聊天/系统公告）。"""
         cmd = self._render_tellraw(sv.tellraw_template, sv.bot_name, message)
-        await self._send_via(sv, cmd)
+        ok = await self._send_via(sv, cmd)
+        if not ok:
+            # 反向桥不通：塞进队列等下一次正向POST带回来
+            await self._enqueue_pending_reply(sv.name, "*", message, "info")
 
     async def _tellraw_private(self, sv: ServerCfg, player: str, message: str, *, with_diagnose: bool = True) -> bool:
         """单独 tellraw 给某玩家（指令回执/错误/绑定提示等）。
 
         返回：是否发送成功。
-        with_diagnose=True：如果 bridge/rcon 发送失败，尝试用另一条更简短的错误提示再发一次（仍失败就返回False）。
+        无论成功与否，如果反向桥不通，都会将消息入队 pending，下一次正向 HTTP 响应体带回 Java 端。
         """
         cmd = self._render_tellraw_to(sv.tellraw_private_template, sv.bot_name, player, message)
         ok = await self._send_via(sv, cmd)
         if ok:
             return True
-        # 原模板可能太复杂导致发送失败，尝试退化成最简单的 /msg 或最朴素的 tellraw
+        # 原模板可能太复杂导致发送失败，尝试退化成最简单的 tellraw
         if with_diagnose:
             fallback_cmd = f'tellraw {player} {{"text":"{message}"}}'
             ok2 = await self._send_via(sv, fallback_cmd)
@@ -592,8 +647,62 @@ class MCBridgePlugin(Star):
             logger.warning(
                 f"[MCBridge][{sv.name}] tellraw_private(玩家={player}) 两度发送失败，"
                 f"通道={sv.send_channel}，MC端插件是否启动？端口/token是否一致？"
+                f"（已进入 pending 队列，下一次正向交互带回）"
             )
+        # 关键：反向桥不通 → 入队，靠下一次 POST /mc_chat 的响应体带回 Java 端直接 sendMessage
+        level = "error" if ("失败" in message or "❌" in message or "错误" in message) else (
+            "success" if ("✅" in message or "成功" in message or "已" == message[:1]) else "info"
+        )
+        await self._enqueue_pending_reply(sv.name, player, message, level)
         return False
+
+    # ------ 正向回传 pending 队列：解决反向桥不通时的"没下文" ------
+    async def _enqueue_pending_reply(self, server_name: str, player: str, msg: str, level: str):
+        """将一条回执塞入 pending 队列（通常是反向桥 tellraw 失败时）。"""
+        try:
+            async with self._reply_pending_lock:
+                q = self._reply_pending.setdefault(server_name, [])
+                q.append({
+                    "player": player,   # "*" 表示广播给所有玩家（fallback不常用）
+                    "msg": str(msg),
+                    "level": level,     # "info" / "error" / "success"
+                    "ts": time.time(),
+                })
+                # 最多积压 200 条，防止内存泄漏
+                if len(q) > 200:
+                    q[:] = q[-200:]
+        except Exception as e:
+            logger.debug(f"[MCBridge] enqueue pending 失败: {e}")
+
+    async def _dequeue_pending_replies(self, server_name: str, player: str) -> list[dict]:
+        """原子取出匹配该服务器+该玩家的 pending 回执（同时取出"*"广播），并从队列里移除。"""
+        try:
+            async with self._reply_pending_lock:
+                q = self._reply_pending.get(server_name)
+                if not q:
+                    return []
+                take: list[dict] = []
+                rest: list[dict] = []
+                for item in q:
+                    if item.get("player") == player or item.get("player") == "*":
+                        # 只取本次请求玩家匹配的（10秒内的老消息也不丢弃，除非超过60秒）
+                        age = time.time() - float(item.get("ts", 0))
+                        if age < 120:
+                            take.append(item)
+                        # 过期就直接丢掉，不进 rest
+                    else:
+                        rest.append(item)
+                # 超过60秒的 rest 也清掉
+                now = time.time()
+                rest = [x for x in rest if now - float(x.get("ts", 0)) < 120]
+                if rest:
+                    self._reply_pending[server_name] = rest
+                else:
+                    self._reply_pending.pop(server_name, None)
+                return take
+        except Exception as e:
+            logger.debug(f"[MCBridge] dequeue pending 失败: {e}")
+            return []
 
     async def _send_via(self, sv: ServerCfg, command: str):
         """统一 bridge/rcon 发送MC命令。"""
