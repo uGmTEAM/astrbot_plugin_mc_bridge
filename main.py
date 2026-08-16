@@ -77,6 +77,7 @@ DATA_DIR = os.path.join(_PLUGIN_DIR, "data")
 SESSION_FILE = os.path.join(DATA_DIR, "mc_session.json")  # key=session_id(MC/QQ) -> entries
 STATE_FILE = os.path.join(DATA_DIR, "mc_state.json")
 BINDING_FILE = os.path.join(DATA_DIR, "mc_bindings.json")
+BINDING_META_FILE = os.path.join(DATA_DIR, "mc_binding_meta.json")  # mid -> {server, player, player_uuid, display}
 FORWARD_FILE = os.path.join(DATA_DIR, "mc_forwards.json")
 
 try:
@@ -183,6 +184,8 @@ class MCBridgePlugin(Star):
         self._bindings: dict[str, str] = self._load_json(BINDING_FILE, {})
         # QQ号反向查绑定的mc_identity_key（1对1）
         self._qq_to_mc: dict[str, str] = {qq: mid for mid, qq in self._bindings.items()}
+        # 绑定元数据: mid -> {server, player, player_uuid, display}；用于从QQ号反查MC身份（QQ→MC推送回复）
+        self._binding_meta: dict[str, dict] = self._load_json(BINDING_META_FILE, {})
         # 转发: group_id(str) -> set[server_name(str)]；* 号代表订阅所有服
         self._parse_forward_groups()
         # 待确认绑定: token -> {mc_id, qq, server, player, display, timeout_at, platform_id, via_event 等}
@@ -229,11 +232,41 @@ class MCBridgePlugin(Star):
         # 注册 LLM 工具
         if bool(self.config.get("ENABLE_NATURAL_LANGUAGE_TOOL", True)):
             self._register_llm_tools()
+        # 迁移：为缺失元数据的旧绑定补充 mid -> {server, player}（仅非正版 mcs[server].player 可解析）
+        self._migrate_binding_meta()
         bind_cnt = len(self._bindings)
         fwd_cnt = sum(len(v) for v in self._forwards.values())
         logger.info(
             f"[MCBridge] 初始化: 绑定={bind_cnt}对, 转发订阅={fwd_cnt}条"
         )
+
+    def _migrate_binding_meta(self):
+        """为缺失 _binding_meta 的旧绑定补充元数据。
+        非正版服 mid=mcs[server].player 可解析；正版服 mid=uuid:xxx 无法解析，需重新绑定。
+        """
+        changed = False
+        for mid in list(self._bindings.keys()):
+            if mid in self._binding_meta:
+                continue
+            m = re.match(r"^mcs\[(.+)\]\.(.+)$", mid)
+            if m:
+                self._binding_meta[mid] = {
+                    "server": m.group(1),
+                    "player": m.group(2),
+                    "player_uuid": "",
+                    "display": m.group(2),
+                }
+                changed = True
+                logger.info(f"[MCBridge] 迁移绑定元数据: {mid}")
+            else:
+                logger.warning(
+                    f"[MCBridge] 绑定 {mid} 缺少元数据且为正版UUID格式，QQ→MC回复推送不可用，建议重新 /bind"
+                )
+        if changed:
+            try:
+                self._save_json(BINDING_META_FILE, self._binding_meta)
+            except Exception as e:
+                logger.warning(f"[MCBridge] 写入迁移后绑定元数据失败: {e}")
 
     async def on_unload(self):
         for t in list(self._bg_tasks):
@@ -360,8 +393,18 @@ class MCBridgePlugin(Star):
             logger.warning(f"[MCBridge] 写入转发配置失败: {e}")
 
     def _mc_session_id(self, sv: ServerCfg) -> str:
-        """MC服务器对应的虚拟会话ID（作为session_id用，QQ群格式一致，便于隔离）。"""
+        """MC服务器对应的虚拟会话ID（未绑定时用）。"""
         return f"mcbridge:GroupMessage:mc_{sv.name}"
+
+    def _unified_session_id(self, sv: ServerCfg, player: str = "", player_uuid: str = "") -> str:
+        """绑定后返回QQ私聊session_id（aiocqhttp:FriendMessage:<QQ>），未绑定返回MC session_id。
+        这样绑定玩家的MC聊天会写入QQ私聊会话，共享上下文/记忆/印象。"""
+        if player:
+            mid = self._mc_identity(sv, player, player_uuid)
+            qq = self._bindings.get(mid)
+            if qq:
+                return f"aiocqhttp:FriendMessage:{qq}"
+        return self._mc_session_id(sv)
 
     def _qq_session_id(self, event_or_umo, platform: str = "", group_id: str = "", user_id: str = "", private: bool = False) -> str:
         """从QQ事件构造统一会话ID，兼容memory_companion的 identity.py。"""
@@ -581,6 +624,9 @@ class MCBridgePlugin(Star):
             self._save_json(BINDING_FILE, self._bindings)
             # 同步刷新反查
             self._qq_to_mc = {qq: mid for mid, qq in self._bindings.items()}
+            # 清理已解绑的元数据，保持一致
+            self._binding_meta = {k: v for k, v in self._binding_meta.items() if k in self._bindings}
+            self._save_json(BINDING_META_FILE, self._binding_meta)
         except Exception as e:
             logger.warning(f"[MCBridge] 写入绑定表失败: {e}")
 
@@ -971,13 +1017,16 @@ class MCBridgePlugin(Star):
         """MC侧自然语言指令：让LLM判断意图=执行安全指令 / 危险指令拒绝 / 不是指令当普通聊天。
         回执一律 tellraw @player 私发（按 tellraw_private_template）。
         """
+        logger.info(f"[MCBridge][{sv.name}] 自然语言指令: player={player} content={content!r} forced={forced}")
         perm = self._permission_for(sv, player, player_uuid)
         if perm == "unbound":
+            logger.info(f"[MCBridge][{sv.name}] 自然语言指令跳过: player={player} 未绑定QQ")
             await self._tellraw_private(sv, player, "你还未绑定QQ号，仅QQ绑定玩家可用自然语言执行指令。请先发送 /bind <QQ号>。")
             return
         # 先调用LLM判别+生成安全指令或拒绝语
         plan = await self._mc_nl_route_with_llm(sv, player, display, content, perm, forced)
         action = plan.get("action")
+        logger.info(f"[MCBridge][{sv.name}] LLM路由结果: action={action} command={plan.get('command','')} message={plan.get('message','')[:80]}")
         if action == "deny":
             msg = plan.get("message") or "这是一条危险指令，请直接使用服务器命令（非自然语言）。"
             await self._tellraw_private(sv, player, msg)
@@ -1043,17 +1092,16 @@ class MCBridgePlugin(Star):
     async def _mc_nl_route_with_llm(self, sv: ServerCfg, player: str, display: str, content: str, perm: str, forced: bool) -> dict:
         """LLM路由：返回 {action: 'deny'|'execute_safe'|'not_command', ...}。
 
-        危险指令关键词清单（匹配"意图/生成结果"）：
-          踢/禁/封：kick / ban / ban-ip / pardon / deop / op
-          创造/物品/资源：gamemode / give / clear / summon / setblock / fill / clone
-          服管：stop / restart / op / deop / whitelist / pardon
-          原始命令：任何以 /mc_ 开头的 AstrBot 命令
+        危险指令关键词清单（仅阻断服务器安全级操作）：
+          服管：stop / restart / shutdown
+          封禁/权限：ban / ban-ip / pardon / op / deop / whitelist
+        give/gamemode/tp/summon/setblock/fill/clone/effect/clear 等不阻断（由LLM根据权限等级决定）。
 
         【关键设计】：该调用走 _llm_generate_clean(skip_persona=True)，
         不叠加 AstrBot 默认 persona、印象、记忆等钩子，避免模型输出"我不是仓库管理员"
         这类与指令路由任务完全无关的、来自聊天人设立场的拒绝。
         """
-        dangerous = r"\b(kick|ban|pardon|op|deop|whitelist|stop|restart|gamemode|give|clear|summon|setblock|fill|clone|execute\s+as|effect)\b"
+        dangerous = r"\b(stop|restart|shutdown|ban|ban-ip|pardon|op|deop|whitelist)\b"
         MUST_HAVE_HINT = "请直接使用游戏内命令（非自然语言）"
         ROLE_PROMPT = (
             "你是 Minecraft 服务器的「指令路由器」，不是聊天助手，也不是玩家的朋友或管家。"
@@ -1062,8 +1110,8 @@ class MCBridgePlugin(Star):
         )
         lines = [
             "任务：把玩家的自然语言请求，判定为以下 3 种动作之一，并用 JSON 输出。",
-            "动作1：execute_safe = 安全查询/自操作类指令（time/weather/help/list/me/say/tp 自己等不会影响他人的小指令），必须输出一条具体的 Minecraft 命令。",
-            f"动作2：deny = 危险指令（踢/ban/op/gamemode/give/setblock/fill/summon/stop/whitelist 等影响他人/服务器状态的指令，或权限不足的操作），用自然语言写一段礼貌的拒绝说明（为什么不能这样做、权限/风险等），并且 message 结尾必须包含「{MUST_HAVE_HINT}」。",
+            "动作1：execute_safe = 可执行指令（time/weather/help/list/me/say/tp/give/gamemode/summon/setblock/fill/clone/effect/clear 等常规游戏指令），必须输出一条具体的 Minecraft 命令。",
+            f"动作2：deny = 危险指令（仅 stop/restart/shutdown/ban/ban-ip/pardon/op/deop/whitelist 等服务器安全级操作），用自然语言写一段礼貌的拒绝说明，并且 message 结尾必须包含「{MUST_HAVE_HINT}」。",
             '动作3：not_command = 这不是指令意图，只是普通闲聊（如"今天天气不错"/"你好"），或你无法识别为可执行 MC 指令的请求，输出 message 字段简短解释为什么不是指令。',
             f"当前玩家权限等级={perm}（仅 superadmin/admin 能做更重操作，member 只能做查询/自操作，unbound 不允许执行）。",
             f"玩家={display or player}, 服务器={sv.name}",
@@ -1095,7 +1143,7 @@ class MCBridgePlugin(Star):
                 return {"action": "deny", "message": _ensure_hint("")}
             return {
                 "action": "not_command",
-                "message": "没有从你的话里识别出可执行的MC指令。识别危险指令（给物品/踢人/改模式等）请直接使用游戏内命令（非自然语言）。",
+                "message": "没有从你的话里识别出可执行的MC指令。如果要做服务器安全级操作（关闭/封禁/OP等），请直接使用游戏内命令。",
             }
         # ---- 剥离 ```json 包裹 ----
         if raw_stripped.startswith("```"):
@@ -1143,7 +1191,9 @@ class MCBridgePlugin(Star):
         player_uuid: str,
         reported_srv: str,
     ):
+        logger.info(f"[MCBridge][{sv.name}] 收到消息: player={player} msg={message!r} uuid={player_uuid[:8] if player_uuid else 'N/A'}")
         if not self._passes_filters(sv, player, message):
+            logger.debug(f"[MCBridge][{sv.name}] 消息被过滤器拦截: player={player} msg={message!r}")
             return
         user_key, _label = self._identity_user_key(sv, player, player_uuid)
         entry = {
@@ -1162,10 +1212,12 @@ class MCBridgePlugin(Star):
         except Exception as e:
             logger.warning(f"[MCBridge][{sv.name}] _handle_mc_command 异常: {e}")
             cmd_handled = False
+        # 绑定后用QQ私聊session_id，未绑定用MC session_id
+        sid = self._unified_session_id(sv, player, player_uuid)
         if cmd_handled:
-            # 这些也写入会话当作"命令事件"记录，但不会记入聊天记忆
+            # 命令事件也写入统一会话
             async with self._lock:
-                ses = self._sessions.setdefault(self._mc_session_id(sv), [])
+                ses = self._sessions.setdefault(sid, [])
                 ses.append({**entry, "event": "mc_cmd"})
                 max_h = int(self.config.get("MAX_HISTORY_PER_SERVER", 300))
                 if len(ses) > max_h:
@@ -1173,9 +1225,9 @@ class MCBridgePlugin(Star):
                 self._save_json(SESSION_FILE, self._sessions)
             return
 
-        # ---- 2) 记录会话 ----
+        # ---- 2) 记录会话（绑定后写入QQ私聊会话） ----
         async with self._lock:
-            ses = self._sessions.setdefault(self._mc_session_id(sv), [])
+            ses = self._sessions.setdefault(sid, [])
             ses.append(entry)
             max_h = int(self.config.get("MAX_HISTORY_PER_SERVER", 300))
             if len(ses) > max_h:
@@ -1189,12 +1241,12 @@ class MCBridgePlugin(Star):
         if bool(self.config.get("ENABLE_FORWARD_MC_TO_QQ", True)):
             self._spawn(self._forward_mc_chat_to_qq(sv, entry))
 
-        # ---- 4) 同步到 memory_companion（异步、批处理，改用 record_visible_turn） ----
+        # ---- 4) 同步到 memory_companion（异步、批处理） ----
         if bool(self.config.get("ENABLE_SYNC_TO_MEMORY_COMPANION", True)):
             self._spawn(
                 self._buffer_and_sync_memory(
                     sv, user_key, player, display, message, "chat", player_uuid=player_uuid,
-                    session_id=self._mc_session_id(sv),
+                    session_id=sid,
                 )
             )
 
@@ -1215,9 +1267,11 @@ class MCBridgePlugin(Star):
             async with self._reply_cooldown(sv, player):
                 if not await self._can_reply_now(sv, player):
                     return
-                reply = await self._generate_reply(sv, player, display, message, player_uuid, user_key)
+                reply = await self._generate_reply(sv, player, display, message, player_uuid, user_key, sid)
             if reply:
+                # 回复发到MC tellraw + 如果绑定了QQ也推到QQ私聊
                 await self._tellraw_broadcast(sv, reply)
+                await self._push_reply_to_qq_if_bound(sv, player, player_uuid, reply)
                 async with self._lock:
                     bot_entry = {
                         "player": sv.bot_name,
@@ -1229,7 +1283,7 @@ class MCBridgePlugin(Star):
                         "is_bot": True,
                         "time": datetime.now().strftime("%H:%M:%S"),
                     }
-                    ses = self._sessions.setdefault(self._mc_session_id(sv), [])
+                    ses = self._sessions.setdefault(sid, [])
                     ses.append(bot_entry)
                     max_h = int(self.config.get("MAX_HISTORY_PER_SERVER", 300))
                     if len(ses) > max_h:
@@ -1239,7 +1293,7 @@ class MCBridgePlugin(Star):
                     self._spawn(
                         self._buffer_and_sync_memory(
                             sv, user_key, sv.bot_name, sv.bot_name, reply, "llm_reply",
-                            player_uuid="", session_id=self._mc_session_id(sv),
+                            player_uuid="", session_id=sid,
                         )
                     )
                 if bool(self.config.get("ENABLE_SYNC_TO_IMPRESSION", True)):
@@ -1431,9 +1485,13 @@ class MCBridgePlugin(Star):
         message: str,
         player_uuid: str,
         user_key: str,
+        sid: str = "",
     ) -> Optional[str]:
+        """生成LLM回复。绑定后sid=QQ私聊session_id，上下文/记忆自动与QQ私聊共享。"""
+        if not sid:
+            sid = self._unified_session_id(sv, player, player_uuid)
         ctx_count = int(self.config.get("LLM_CONTEXT_COUNT", 20))
-        history = list(self._sessions.get(self._mc_session_id(sv), []))
+        history = list(self._sessions.get(sid, []))
         recent = history[-ctx_count:] if ctx_count > 0 else history
 
         # 正版服：若 ENABLE_CROSS_SERVER_CONTEXT，补充其他正版服同名 UUID 用户的近期消息
@@ -1445,7 +1503,7 @@ class MCBridgePlugin(Star):
         ):
             extra = []
             for srv_name, srv_ses in self._sessions.items():
-                if srv_name == self._mc_session_id(sv):
+                if srv_name == sid:
                     continue
                 srv_obj = None
                 for sn, obj in self._servers.items():
@@ -1473,7 +1531,7 @@ class MCBridgePlugin(Star):
         # 共享记忆检索（QQ/MC合并）
         mem_lines = await self._compose_shared_memory(
             user_key=user_key,
-            session_id=self._mc_session_id(sv),
+            session_id=sid,
             query=message,
         )
         if mem_lines:
@@ -1498,6 +1556,22 @@ class MCBridgePlugin(Star):
         if not reply:
             return None
         return reply.strip().strip('"').strip("'") or None
+
+    async def _push_reply_to_qq_if_bound(self, sv: ServerCfg, player: str, player_uuid: str, reply: str):
+        """如果MC玩家绑定了QQ，把bot回复也推到QQ私聊（双向同步）。"""
+        mid = self._mc_identity(sv, player, player_uuid)
+        qq = self._bindings.get(mid)
+        if not qq:
+            return
+        bot = self._cached_bot
+        if bot is None:
+            logger.debug(f"[MCBridge] bot未缓存，跳过推送到QQ私聊")
+            return
+        try:
+            await bot.api.send_private_msg(user_id=int(qq), message=reply)
+            logger.info(f"[MCBridge] MC回复已推送到QQ私聊: qq={qq}")
+        except Exception as e:
+            logger.warning(f"[MCBridge] 推送回复到QQ私聊失败: {e}")
 
     async def _send_via_rcon(self, sv: ServerCfg, command: str) -> bool:
         if not sv.mc_rcon_password:
@@ -1609,12 +1683,14 @@ class MCBridgePlugin(Star):
         buf.clear()
         companion = self._get_memory_companion()
         if not companion:
+            logger.warning(f"[MCBridge] memory_companion 未注册，记忆同步跳过（batch={len(batch)}条）")
             return
         bridge = (
             getattr(companion, "bridge", None)
             or getattr(companion, "_bridge", None)
             or getattr(companion, "memory_companion", None)
         )
+        logger.info(f"[MCBridge] 记忆同步: batch={len(batch)}条 user_key={user_key} companion={'有bridge' if bridge else '无bridge'}")
 
         # ---- 1) 首选 bridge.record_visible_turn（短期 timeline） ----
         if bridge and callable(getattr(bridge, "record_visible_turn", None)):
@@ -1655,6 +1731,7 @@ class MCBridgePlugin(Star):
                     logger.debug(f"[MCBridge] record_visible_turn 失败(单条跳过): {e}")
             else:
                 # 全部写入成功就不再fallback
+                logger.info(f"[MCBridge] 记忆同步成功: record_visible_turn 写入{len(batch)}条")
                 return
 
         # ---- 2) 回退 bridge.submit_emotion_event ----
@@ -2747,6 +2824,13 @@ class MCBridgePlugin(Star):
                         reply_txt = "绑定失败：你的QQ号已绑定过另一个MC身份，请先 /unbind。"
                     else:
                         self._bindings[mc_id] = qq
+                        # 写入绑定元数据：mid -> {server, player, player_uuid, display}；供QQ→MC回复推送反查
+                        self._binding_meta[mc_id] = {
+                            "server": info.get("server", ""),
+                            "player": info.get("player", ""),
+                            "player_uuid": info.get("player_uuid", ""),
+                            "display": info.get("display", ""),
+                        }
                         self._save_bindings()
                         reply_txt = (
                             f"✅ 绑定成功：MC[{info.get('server','')}] {info.get('display','')}"
@@ -2856,6 +2940,61 @@ class MCBridgePlugin(Star):
                         triggered=False, session_id=session_id, qq_only=True,
                     )
                 )
+
+    # ---- QQ侧bot回复同步推送MC（on_decorating_result 钩子） ----
+    # 绑定后视为QQ私聊会话：QQ用户私聊bot时，bot回复不仅发到QQ，也 tellraw 私发给绑定的MC玩家，
+    # 实现双向互通（MC→QQ 已由 _push_reply_to_qq_if_bound 实现；QQ→MC 由本钩子实现）。
+    # 群消息不推送，避免干扰。MC自身产生的回复不会触发本钩子（MC消息不走AstrBot event管道）。
+    @filter.on_decorating_result()
+    async def _on_qq_reply_decorating(self, event: AstrMessageEvent, *args, **kwargs):
+        if not bool(self.config.get("ENABLE_PUSH_QQ_REPLY_TO_MC", True)):
+            return
+        try:
+            platform = str(event.get_platform_name() or event.get_platform_id() or "")
+        except Exception:
+            platform = ""
+        if platform.lower() != "aiocqhttp":
+            return
+        # 仅私聊场景推送（群消息不推MC，避免刷屏）
+        try:
+            is_private = bool(event.is_private_chat()) if hasattr(event, "is_private_chat") else False
+        except Exception:
+            is_private = False
+        if not is_private:
+            return
+        qq = str(event.get_sender_id() or "")
+        if not qq:
+            return
+        mid = self._qq_to_mc.get(qq)
+        if not mid:
+            return
+        meta = self._binding_meta.get(mid)
+        if not meta:
+            return
+        sv_name = meta.get("server", "")
+        sv = self._servers.get(sv_name)
+        if sv is None:
+            return
+        player = meta.get("player", "")
+        if not player:
+            return
+        # 取回复纯文本
+        try:
+            result = event.get_result()
+        except Exception:
+            result = None
+        if result is None:
+            return
+        try:
+            text = result.get_plain_text() if hasattr(result, "get_plain_text") else ""
+        except Exception:
+            text = ""
+        text = (text or "").strip()
+        if not text:
+            return
+        # tellraw 私发给绑定的MC玩家
+        self._spawn(self._tellraw_private(sv, player, text))
+        logger.info(f"[MCBridge] QQ私聊回复推送MC: qq={qq} player={player} server={sv_name}")
 
     # ------------------------------------------------------------------ 杂项工具
 

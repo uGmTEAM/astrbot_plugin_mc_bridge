@@ -159,5 +159,6 @@
     "ENABLE_FORWARD_MC_TO_QQ": {"description": "【消息桥】总开关：是否把MC玩家聊天按 FORWARD_GROUPS + /mc_forward 动态订阅转发到QQ群。关闭后记忆仍同步，只是不发群消息。", "type": "bool", "default": true},
     "BIND_CONFIRM_TIMEOUT": {"description": "【绑定】玩家执行 /bind <QQ号> 后，等待QQ方真人确认的超时时间(秒)。超时自动取消绑定请求。", "type": "int", "default": 300},
     "FORWARD_FMT_MC_TO_QQ": {"description": "【消息桥】MC聊天转发到QQ群的文本格式。占位符: {server}=服名, {player}=玩家ID, {display}=显示名, {message}=消息正文, {time}=HH:MM:SS", "type": "string", "default": "[MC|{server}] <{display}> {message}"},
-    "FORWARD_FMT_QQ_TO_MC": {"description": "【消息桥】QQ群消息同步进MC记忆时的来源标签。占位符: {group}=群号, {group_name}=群名, {sender}=昵称, {qq}=QQ号, {message}=正文", "type": "string", "default": "[QQ群{group}] <{sender}> {message}"}
+    "FORWARD_FMT_QQ_TO_MC": {"description": "【消息桥】QQ群消息同步进MC记忆时的来源标签。占位符: {group}=群号, {group_name}=群名, {sender}=昵称, {qq}=QQ号, {message}=正文", "type": "string", "default": "[QQ群{group}] <{sender}> {message}"},
+    "ENABLE_PUSH_QQ_REPLY_TO_MC": {"description": "【双向互通】绑定后，QQ用户私聊bot时，bot回复是否同步 tellraw 私发给绑定的MC玩家。开启后实现QQ↔MC双向回复可见（MC→QQ由系统自动处理）。群消息不推送。", "type": "bool", "default": true}
 }
