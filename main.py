@@ -1589,25 +1589,144 @@ class MCBridgePlugin(Star):
 
     # ------------------------------------------------------------------ LLM 回复生成（含跨服上下文）
 
-    async def _get_system_prompt(self) -> str:
-        pm = getattr(self.context, "persona_manager", None)
-        if pm is None:
+    def _read_impression_block(self, user_key: str) -> str:
+        """从 impression 插件读取用户 key 对应的 印象段落 + 名称信息。
+        输出格式与 impression._inject_summary 自动注入到 event.system_prompt 的内容完全一致，
+        这样 MC 侧直接 context.llm_generate 不走事件管道时，也能拿到与 QQ 侧完全相同的印象。
+        返回空字符串表示该用户无印象记录。
+        """
+        if not user_key:
             return ""
-        persona = None
+        imp = self._get_impression_plugin()
+        if imp is None:
+            return ""
+        summaries = getattr(imp, "_summaries", None)
+        if not isinstance(summaries, dict):
+            return ""
+        obj = summaries.get(user_key)
+        if not isinstance(obj, dict) or not obj.get("summary"):
+            return ""
+        text = str(obj.get("summary", ""))
+        # header 优先从 impression config 取，降级为默认 DEFAULT_HEADER
+        # 防御：imp.config 在 AstrBot 插件里可能是 dict 也可能是 callable 方法
+        header = ""
         try:
-            persona = await pm.get_default_persona_v3(umo=None)
+            cfg_obj = getattr(imp, "config", None)
+            if callable(cfg_obj):
+                cfg_obj = cfg_obj()
+            if isinstance(cfg_obj, dict):
+                header = str(cfg_obj.get("header_text") or "")
         except Exception:
+            header = ""
+        if not header:
+            header = "以下是我对这个人的当前印象（每次和这个人聊天我都会以此为参考来保持语气和记忆连贯）："
+        # 名称信息块（首见名/最新名/偏好名）
+        first_seen = (
+            str(obj.get("first_seen_name", "") or obj.get("user_name", "") or "").strip()
+        )
+        latest = str(obj.get("latest_name", "") or first_seen).strip()
+        preferred = str(obj.get("user_preferred_name", "") or "").strip()
+        call_name = preferred or first_seen or latest
+        name_lines: list[str] = []
+        if call_name:
+            name_lines.append(f"当前对话用户称呼：{call_name}")
+        if first_seen and first_seen != call_name:
+            name_lines.append(f"首次记录名称：{first_seen}")
+        if latest and latest != first_seen and latest != call_name:
+            name_lines.append(f"最新名称：{latest}")
+        if preferred and preferred != call_name:
+            name_lines.append(f"用户偏好名称：{preferred}")
+        name_block = ""
+        if name_lines:
+            name_block = "【对话人名称信息】\n" + "\n".join(name_lines) + "\n\n"
+        # inject_mode: 默认 system_prompt（我们只支持 system_prompt 模式，和 impression 默认一致）
+        summary_block = f"{header}\n{text}"
+        full = name_block + summary_block if name_block else summary_block
+        logger.info(
+            f"[MCBridge] 从 impression 手动读取印象块注入: user_key={user_key} "
+            f"call_name={call_name!r} summary_len={len(text)}"
+        )
+        return full
+
+    async def _get_system_prompt(self, *, bound_qq: Optional[str] = None, user_key: str = "") -> str:
+        """获取 AstrBot 默认人设。
+        参数（MC 绑定用户才会传）：
+          - bound_qq：绑定的 QQ 号，用于构造 persona_manager 所需 umo
+            （AstrBot 事件管道里的 QQ 私聊会以这个 umo 作为上下文标识）
+          - user_key：用于从 impression 插件读取对应印象（格式 user:<QQ号> 或 mcs[...]）
+
+        【根因修复】：MC 侧直接调 context.llm_generate 绕过 AstrBot 事件管道 →
+        impression 的 @filter.on_llm_request() 钩子不触发 → 印象不注入。
+        本方法在默认人设 prompt 之后，手动拼接 impression 保存的印象块，
+        让 MC 侧 LLM 看到的 system_prompt 与 QQ 私聊里完全一致。
+        """
+        pm = getattr(self.context, "persona_manager", None)
+        sp = ""
+        if pm is not None:
+            # 绑定用户优先用正确 umo 取 persona；未绑定回退到 umo=None
+            umo = f"aiocqhttp:FriendMessage:{bound_qq}" if bound_qq else None
+            persona = None
             try:
-                persona = pm.get_default_persona_v3(umo=None)
+                persona = await pm.get_default_persona_v3(umo=umo)
+            except Exception:
+                try:
+                    persona = pm.get_default_persona_v3(umo=umo)
+                except Exception as e:
+                    logger.debug(f"[MCBridge] get_default_persona_v3(umo={umo!r}) 失败: {e}")
+                    persona = None
+            if persona is None and umo is not None:
+                # 个别版本不接收 umo 参数时，再兜底一次
+                try:
+                    persona = await pm.get_default_persona_v3(umo=None)
+                except Exception:
+                    try:
+                        persona = pm.get_default_persona_v3(umo=None)
+                    except Exception:
+                        persona = None
+            if persona:
+                val = getattr(persona, "prompt", None)
+                if not val and isinstance(persona, dict):
+                    val = persona.get("prompt", "")
+                sp = str(val or "")
+        # 印象块（从 impression._summaries 手动读取，完全对齐 QQ 侧的 _inject_summary 输出格式）
+        impression_block = ""
+        if user_key:
+            try:
+                impression_block = self._read_impression_block(user_key)
             except Exception as e:
-                logger.debug(f"[MCBridge] get_default_persona_v3 失败: {e}")
-                return ""
-        if not persona:
-            return ""
-        sp = getattr(persona, "prompt", None)
-        if not sp and isinstance(persona, dict):
-            sp = persona.get("prompt", "")
-        return str(sp or "")
+                logger.warning(f"[MCBridge] 手动读取印象块异常: {e}")
+        # 再额外尝试 memory_companion.compose_context 注入共享记忆（如果插件暴露了该方法）
+        memory_block = ""
+        if user_key:
+            mem = self._get_memory_companion()
+            if mem is not None:
+                composer = getattr(mem, "compose_context", None)
+                if callable(composer):
+                    try:
+                        args: dict = {"user_key": user_key, "limit": 12, "min_score": 0.22}
+                        if bound_qq:
+                            args["umo"] = f"aiocqhttp:FriendMessage:{bound_qq}"
+                        result = composer(**args)
+                        if asyncio.iscoroutine(result):
+                            result = await asyncio.wait_for(result, timeout=3.0)
+                        if isinstance(result, list):
+                            items = [str(x) for x in result if x]
+                            if items:
+                                memory_block = (
+                                    "【我的相关记忆（用于保持长期记忆连贯，仅供参考）】\n"
+                                    + "\n".join(f"- {x}" for x in items[:12])
+                                )
+                        elif isinstance(result, str) and result.strip():
+                            memory_block = (
+                                "【我的相关记忆（用于保持长期记忆连贯，仅供参考）】\n"
+                                + result.strip()
+                            )
+                    except Exception as e:
+                        logger.debug(f"[MCBridge] memory_companion compose 失败: {e}")
+        # 合并：默认人设 → 印象块 → 共享记忆块（顺序与 QQ 事件管道注入顺序一致）
+        parts = [s for s in (sp, impression_block, memory_block) if s and isinstance(s, str)]
+        merged = "\n\n".join(parts)
+        return merged.strip()
 
     def _get_provider_id(self) -> Optional[str]:
         try:
@@ -1624,18 +1743,32 @@ class MCBridgePlugin(Star):
         except Exception:
             return None
 
-    async def _llm_generate_text(self, prompt: str, system_prompt: str) -> Optional[str]:
-        """普通聊天式 LLM 调用：叠加默认 persona（_get_system_prompt），走 AstrBot 原生 llm_generate 钩子链。
-        适用：MC/QQ 侧普通闲聊回复、印象生成。"""
-        return await self._llm_generate_clean(prompt, system_prompt, skip_persona=False)
+    async def _llm_generate_text(
+        self, prompt: str, system_prompt: str, *, bound_qq: Optional[str] = None, user_key: str = ""
+    ) -> Optional[str]:
+        """普通聊天式 LLM 调用：叠加默认 persona（_get_system_prompt）+ 印象+记忆。
+        参数 bound_qq / user_key 仅在 MC 侧绑定用户场景下传入，
+        作用是让 _get_system_prompt 能读取对应用户的 impression 块和共享记忆。
+        """
+        return await self._llm_generate_clean(
+            prompt, system_prompt, skip_persona=False, bound_qq=bound_qq, user_key=user_key
+        )
 
-    async def _llm_generate_clean(self, prompt: str, system_prompt: str, *, skip_persona: bool = False) -> Optional[str]:
+    async def _llm_generate_clean(
+        self,
+        prompt: str,
+        system_prompt: str,
+        *,
+        skip_persona: bool = False,
+        bound_qq: Optional[str] = None,
+        user_key: str = "",
+    ) -> Optional[str]:
         """底层 LLM 调用。
-        - skip_persona=False（默认）：system_prompt 会叠加 AstrBot 默认人设 prompt，适合普通聊天。
-        - skip_persona=True：**完全不叠加**默认人设/印象/记忆等任何 AstrBot 钩子注入的 system 内容，
-          只使用调用方显式传入的 system_prompt 作为角色约束。适用于：
-          * MC 自然语言指令路由（必须严格输出 JSON，不能冒出"我不是仓库管理员"这类人设拒绝）
-          * 其它要求 LLM 输出严格结构化 JSON 的任务。
+        - skip_persona=False（默认）：_get_system_prompt 会叠加 AstrBot 默认人设 +
+          （绑定 MC 用户时）手动从 impression 读取的印象块 + memory_companion 共享记忆，
+          再与调用方传入的 system_prompt（如"简短自然回复玩家提问"）合并。
+        - skip_persona=True：完全不叠加默认人设/印象/记忆，只使用调用方显式传入的
+          system_prompt。适用于 MC 自然语言指令路由等严格 JSON 输出场景。
         """
         provider_id = self._get_provider_id()
         if not provider_id:
@@ -1643,15 +1776,11 @@ class MCBridgePlugin(Star):
             return None
         kwargs = {"chat_provider_id": provider_id, "prompt": prompt}
         if skip_persona:
-            # 关键：显式传我们自带的干净 system_prompt，并且不走 _get_system_prompt 叠加。
-            # llm_generate 收到非空的 system_prompt 参数时，通常会以"传入者优先"覆盖默认人设。
-            # 为了保险同时避免印象插件在 pre_invoke 钩子内改写 system_prompt，这里用一个"明确覆盖"的策略：
-            # 如果最终文本里含"我不是仓库管理员"等不相关拒绝，说明钩子链仍被注入——解析层会兜底处理。
             if system_prompt:
                 kwargs["system_prompt"] = system_prompt
         else:
-            # 默认模式：合并默认 persona + 调用方传入的额外角色约束（如果有）
-            default_sp = await self._get_system_prompt()
+            # 默认模式：（默认人设 + 【印象块】 + 【共享记忆块】） + 调用方额外角色约束
+            default_sp = await self._get_system_prompt(bound_qq=bound_qq, user_key=user_key)
             merged = ""
             if default_sp:
                 merged = default_sp
@@ -1659,6 +1788,12 @@ class MCBridgePlugin(Star):
                 merged = (merged + "\n\n" + system_prompt) if merged else system_prompt
             if merged:
                 kwargs["system_prompt"] = merged
+            if bound_qq or user_key:
+                logger.info(
+                    f"[MCBridge] LLM system_prompt 合并完成: "
+                    f"bound_qq={bound_qq!r} user_key={user_key!r} "
+                    f"merged_len={len(kwargs.get('system_prompt', ''))}"
+                )
         try:
             resp = await self.context.llm_generate(**kwargs)
             text = resp.completion_text if resp else None
@@ -1824,8 +1959,16 @@ class MCBridgePlugin(Star):
         if cross_parts:
             prompt_parts.extend(cross_parts)
         prompt = "\n\n".join(prompt_parts)
-        sp = await self._get_system_prompt()
-        reply = await self._llm_generate_text(prompt, sp)
+        # 把当前用户的 bound_qq 和 user_key 透传给 LLM 层，
+        # 这样 _get_system_prompt / _read_impression_block 能注入 人设+印象+共享记忆，
+        # 与 QQ 私聊里 AstrBot 事件管道注入的内容完全一致。
+        #
+        # 关键：_bindings 的 key 是 MC 身份（uuid:... 或 mcs[server].player），
+        #      必须用 self._mc_identity(...) 查询，不能用 user_key（格式是 user:xxx）。
+        mid = self._mc_identity(sv, player, player_uuid)
+        bound_qq = self._bindings.get(mid) or None
+        sp = ""  # 注意：_get_system_prompt 的输出已经在 _llm_generate_text 内部自动叠加，这里不要传空额外约束
+        reply = await self._llm_generate_text(prompt, sp, bound_qq=bound_qq, user_key=user_key)
         if not reply:
             return None
         reply = reply.strip().strip('"').strip("'") or None
