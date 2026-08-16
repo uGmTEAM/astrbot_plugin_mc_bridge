@@ -162,5 +162,12 @@
     "BIND_CONFIRM_TIMEOUT": {"description": "【绑定】玩家执行 /bind <QQ号> 后，等待QQ方真人确认的超时时间(秒)。超时自动取消绑定请求。", "type": "int", "default": 300},
     "FORWARD_FMT_MC_TO_QQ": {"description": "【消息桥】MC聊天转发到QQ群的文本格式。占位符: {server}=服名, {player}=玩家ID, {display}=显示名, {message}=消息正文, {time}=HH:MM:SS", "type": "string", "default": "[MC|{server}] <{display}> {message}"},
     "FORWARD_FMT_QQ_TO_MC": {"description": "【消息桥】QQ群消息同步进MC记忆时的来源标签。占位符: {group}=群号, {group_name}=群名, {sender}=昵称, {qq}=QQ号, {message}=正文", "type": "string", "default": "[QQ群{group}] <{sender}> {message}"},
-    "ENABLE_PUSH_QQ_REPLY_TO_MC": {"description": "【双向互通】绑定后，QQ用户私聊bot时，bot回复是否同步 tellraw 私发给绑定的MC玩家。开启后实现QQ↔MC双向回复可见（MC→QQ由系统自动处理）。群消息不推送。", "type": "bool", "default": true}
+    "ENABLE_PUSH_QQ_REPLY_TO_MC": {"description": "【双向互通·QQ→MC】绑定后，QQ用户私聊bot时，bot回复是否同步 tellraw 私发给绑定的MC玩家。群消息不推送。", "type": "bool", "default": true},
+    "ENABLE_PUSH_MC_REPLY_TO_QQ": {"description": "【双向互通·MC→QQ】绑定后，MC玩家触发LLM回复时，是否把回复也推送到绑定的QQ私聊。默认关闭：MC问的问题应在MC里回答。会话/记忆/印象仍共享。", "type": "bool", "default": false},
+    "ENABLE_ASK_COMMAND": {"description": "【知识库】MC内 /ask <问题> 指令总开关。开启后玩家可用 /ask 查询知识库，结果 tellraw 私发。无冷却。", "type": "bool", "default": true},
+    "ENABLE_BUILTIN_KB": {"description": "【知识库】是否优先查询AstrBot内置知识库（通过context API自动检索已注册的知识库/向量provider）。", "type": "bool", "default": true},
+    "ENABLE_ASK_LLM_FALLBACK": {"description": "【知识库】当内置知识库和外部API都未找到答案时，是否回退到LLM正常回复。关闭则只返回'未找到'。", "type": "bool", "default": true},
+    "KB_EXTERNAL_API_URL": {"description": "【知识库】外部知识库API地址。留空则跳过外部查询。格式：http://ip:port/api/ask。详见 KB_EXTERNAL_API.md。", "type": "string", "default": ""},
+    "KB_EXTERNAL_API_TOKEN": {"description": "【知识库】外部知识库API的Bearer Token鉴权。留空则不携带Authorization头。", "type": "string", "default": ""},
+    "KB_EXTERNAL_TIMEOUT": {"description": "【知识库】外部知识库API请求超时时间(秒)。", "type": "int", "default": 10}
 }

@@ -875,11 +875,12 @@ class MCBridgePlugin(Star):
         return "member"
 
     async def _handle_mc_command(self, sv: ServerCfg, player: str, display: str, message: str, ts: int, player_uuid: str):
-        """MC端输入的 指令消息（/开头）。目前只处理 /bind /unbind /ai 前缀。
+        """MC端输入的 指令消息（/开头）。处理 /bind /unbind /ai /ask 前缀。
 
         /bind <QQ号>：游戏内绑定，会在QQ端向 <QQ号> 真人发二次确认
         /unbind：解绑当前MC玩家
         /ai <自然语言>：显式进入"自然语言指令"模式，独立冷却15s。
+        /ask <问题>：查询知识库（内置→外部→LLM回退），结果 tellraw 私发，同时存入会话。
         其它命令：AstrBot端不介入，原样忽略。
         """
         stripped = message.strip()
@@ -1022,6 +1023,19 @@ class MCBridgePlugin(Star):
                 return True
             await self._dispatch_mc_natural_command(sv, player, display, player_uuid, content, forced=True)
             return True
+
+        # ----- /ask <问题> -----
+        m3 = re.match(r"^/ask\s+(.+)$", stripped, re.DOTALL)
+        if m3:
+            question = m3.group(1).strip()
+            if not bool(self.config.get("ENABLE_ASK_COMMAND", True)):
+                await self._tellraw_private(sv, player, "管理员关闭了知识库询问功能。")
+                return True
+            if not question:
+                await self._tellraw_private(sv, player, "用法：/ask <你的问题>")
+                return True
+            self._spawn(self._handle_mc_ask(sv, player, display, player_uuid, question))
+            return True
         return False
 
     async def _dispatch_mc_natural_command(self, sv: ServerCfg, player: str, display: str, player_uuid: str, content: str, forced: bool):
@@ -1109,6 +1123,216 @@ class MCBridgePlugin(Star):
         # 转义并拼接为 \b(word1|word2|...)\b
         escaped = "|".join(re.escape(w) for w in words)
         return r"\b(" + escaped + r")\b"
+
+    # ------------------------------------------------------------------ /ask 知识库检索
+
+    async def _query_builtin_kb(self, query: str, session_id: str = "") -> Optional[str]:
+        """查询 AstrBot 内置知识库。返回答案文本或 None。
+
+        防御式实现：依次尝试 context 上的知识库方法、provider_manager 中的检索型 provider，
+        兼容不同版本 AstrBot 的知识库 API 差异。任一途径拿到非空结果即返回。
+        """
+        ctx = self.context
+        if ctx is None:
+            return None
+
+        # 方式1: context 上直接挂载的知识库方法
+        for method_name in ("query_knowledge_base", "retrieve_knowledge", "search_knowledge"):
+            method = getattr(ctx, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(query, session_id=session_id) if session_id else method(query)
+                if asyncio.iscoroutine(result):
+                    result = await asyncio.wait_for(result, timeout=10)
+                text = self._extract_kb_result(result)
+                if text:
+                    logger.info(f"[MCBridge] 内置KB命中(context.{method_name}): len={len(text)}")
+                    return text
+            except Exception as e:
+                logger.debug(f"[MCBridge] context.{method_name} 失败: {e}")
+
+        # 方式2: provider_manager 中查找检索型 provider
+        try:
+            pm = getattr(ctx, "provider_manager", None)
+            if pm:
+                inst_map = getattr(pm, "inst_map", {}) or {}
+                for pid, provider in inst_map.items():
+                    for method_name in ("retrieve", "query", "search_knowledge", "search"):
+                        method = getattr(provider, method_name, None)
+                        if not callable(method):
+                            continue
+                        try:
+                            result = method(query)
+                            if asyncio.iscoroutine(result):
+                                result = await asyncio.wait_for(result, timeout=10)
+                            text = self._extract_kb_result(result)
+                            if text:
+                                logger.info(f"[MCBridge] 内置KB命中(provider:{pid}.{method_name}): len={len(text)}")
+                                return text
+                        except Exception as e:
+                            logger.debug(f"[MCBridge] provider {pid}.{method_name} 失败: {e}")
+        except Exception as e:
+            logger.debug(f"[MCBridge] 内置KB provider扫描异常: {e}")
+
+        return None
+
+    @staticmethod
+    def _extract_kb_result(result) -> str:
+        """从知识库返回值中提取纯文本。兼容 str / list / dict 等常见格式。"""
+        if result is None:
+            return ""
+        if isinstance(result, str):
+            return result.strip()
+        if isinstance(result, list):
+            texts = []
+            for item in result[:5]:
+                if isinstance(item, str):
+                    texts.append(item)
+                elif isinstance(item, dict):
+                    t = item.get("content") or item.get("text") or item.get("answer") or item.get("page_content") or ""
+                    if t:
+                        texts.append(str(t))
+            return "\n".join(texts).strip()
+        if isinstance(result, dict):
+            for key in ("answer", "result", "content", "text", "data"):
+                val = result.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+                if isinstance(val, list):
+                    return MCBridgePlugin._extract_kb_result(val)
+        return ""
+
+    async def _query_external_kb(self, query: str) -> Optional[str]:
+        """查询外部知识库 API。返回答案文本或 None。
+
+        API 配置：KB_EXTERNAL_API_URL / KB_EXTERNAL_API_TOKEN / KB_EXTERNAL_TIMEOUT。
+        请求格式：POST {"query": "...", "question": "..."}，Bearer Token 鉴权。
+        响应格式兼容：{"answer": "..."} / {"result": "..."} / {"content": "..."} / 纯文本。
+        """
+        api_url = str(self.config.get("KB_EXTERNAL_API_URL", "") or "").strip()
+        if not api_url:
+            return None
+        if aiohttp is None:
+            logger.warning("[MCBridge] aiohttp 未安装，无法查询外部知识库")
+            return None
+        api_token = str(self.config.get("KB_EXTERNAL_API_TOKEN", "") or "").strip()
+        try:
+            timeout_sec = int(self.config.get("KB_EXTERNAL_TIMEOUT", 10))
+        except (TypeError, ValueError):
+            timeout_sec = 10
+
+        headers = {"Content-Type": "application/json"}
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+        payload = {"query": query, "question": query}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url, json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"[MCBridge] 外部KB API返回 HTTP {resp.status}")
+                        return None
+                    data = await resp.json()
+                    text = self._extract_kb_result(data)
+                    if text:
+                        logger.info(f"[MCBridge] 外部KB命中: len={len(text)}")
+                    return text or None
+        except Exception as e:
+            logger.warning(f"[MCBridge] 外部KB API查询失败: {e}")
+            return None
+
+    async def _handle_mc_ask(
+        self, sv: ServerCfg, player: str, display: str, player_uuid: str, question: str
+    ):
+        """处理 /ask 指令：知识库检索（内置→外部→LLM回退），结果 tellraw 私发，同时存入会话。"""
+        logger.info(f"[MCBridge][{sv.name}] /ask: player={player} question={question!r}")
+
+        # 提示正在查询
+        await self._tellraw_private(sv, player, "🔍 正在查询知识库...")
+
+        user_key, _label = self._identity_user_key(sv, player, player_uuid)
+        sid = self._unified_session_id(sv, player, player_uuid)
+
+        answer: Optional[str] = None
+        source = ""
+
+        # 1) 内置知识库
+        if not answer and bool(self.config.get("ENABLE_BUILTIN_KB", True)):
+            try:
+                answer = await self._query_builtin_kb(question, session_id=sid)
+                if answer:
+                    source = "内置知识库"
+            except Exception as e:
+                logger.warning(f"[MCBridge] 内置KB查询异常: {e}")
+
+        # 2) 外部 API
+        if not answer:
+            try:
+                answer = await self._query_external_kb(question)
+                if answer:
+                    source = "外部知识库"
+            except Exception as e:
+                logger.warning(f"[MCBridge] 外部KB查询异常: {e}")
+
+        # 3) LLM 回退
+        if not answer and bool(self.config.get("ENABLE_ASK_LLM_FALLBACK", True)):
+            try:
+                answer = await self._generate_reply(
+                    sv, player, display, question, player_uuid, user_key, sid
+                )
+                if answer:
+                    source = "LLM"
+            except Exception as e:
+                logger.warning(f"[MCBridge] LLM回退异常: {e}")
+
+        if not answer:
+            answer = "未找到相关内容，请稍后再试或换个问法。"
+            source = "无"
+
+        # 格式化回复（知识库来源加标注，LLM 回复保持自然）
+        if source in ("内置知识库", "外部知识库"):
+            reply = f"📚 [{source}]\n{answer}"
+        else:
+            reply = answer
+
+        # tellraw 私发给提问玩家
+        await self._tellraw_private(sv, player, reply)
+
+        # 存入会话（bot 回复）
+        async with self._lock:
+            bot_entry = {
+                "player": sv.bot_name,
+                "name": sv.bot_name,
+                "player_uuid": "",
+                "server": sv.name,
+                "message": reply,
+                "timestamp": int(time.time() * 1000),
+                "is_bot": True,
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "event": "ask_reply",
+            }
+            ses = self._sessions.setdefault(sid, [])
+            ses.append(bot_entry)
+            max_h = int(self.config.get("MAX_HISTORY_PER_SERVER", 300))
+            if len(ses) > max_h:
+                ses[:] = ses[-max_h:]
+            self._save_json(SESSION_FILE, self._sessions)
+
+        # 同步到 memory_companion
+        if bool(self.config.get("ENABLE_SYNC_TO_MEMORY_COMPANION", True)):
+            self._spawn(
+                self._buffer_and_sync_memory(
+                    sv, user_key, sv.bot_name, sv.bot_name,
+                    f"[知识库问答] Q: {question} A: {answer}", "ask_qa",
+                    player_uuid="", session_id=sid,
+                )
+            )
+
+        logger.info(f"[MCBridge][{sv.name}] /ask 完成: source={source} answer_len={len(answer)}")
 
     async def _mc_nl_route_with_llm(self, sv: ServerCfg, player: str, display: str, content: str, perm: str, forced: bool) -> dict:
         """LLM路由：返回 {action: 'deny'|'execute_safe'|'not_command', ...}。
@@ -1289,9 +1513,11 @@ class MCBridgePlugin(Star):
                     return
                 reply = await self._generate_reply(sv, player, display, message, player_uuid, user_key, sid)
             if reply:
-                # 回复发到MC tellraw + 如果绑定了QQ也推到QQ私聊
+                # 回复发到MC tellraw（主通道）
                 await self._tellraw_broadcast(sv, reply)
-                await self._push_reply_to_qq_if_bound(sv, player, player_uuid, reply)
+                # MC→QQ 回复推送（默认关闭：MC问的问题应在MC回答，不推到QQ私聊）
+                if bool(self.config.get("ENABLE_PUSH_MC_REPLY_TO_QQ", False)):
+                    await self._push_reply_to_qq_if_bound(sv, player, player_uuid, reply)
                 async with self._lock:
                     bot_entry = {
                         "player": sv.bot_name,
