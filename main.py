@@ -926,13 +926,20 @@ class MCBridgePlugin(Star):
                 "player": player, "display": display or player,
                 "player_uuid": player_uuid, "timeout_at": timeout_at,
             }
+            timeout_sec = int(self.config.get("BIND_CONFIRM_TIMEOUT", 300))
             # 1) 优先私聊确认
             ask_prompt = (
-                f"【身份绑定二次确认】\n"
-                f"玩家 [{sv.name}] {display or player} 尝试把MC身份与你的QQ号绑定。\n"
-                f"确认请回复：同意 / 是 / y / 确认\n"
-                f"拒绝请回复：拒绝 / 否 / n / cancel\n"
-                f"（如直接回复无效，请发送：/mc_bind_confirm y 或 /mc_bind_confirm n）"
+                f"【MC身份绑定 - 二次确认】\n"
+                f"MC玩家 [{sv.name}] {display or player} 请求把 MC 身份与你的 QQ 号绑定。\n"
+                f"━━━ 两种确认方式（任选其一）━━━\n"
+                f"① 【推荐·私聊直接回复】\n"
+                f"   同意 → 回复一个字：y  或  是  或  同意  或  确认\n"
+                f"   拒绝 → 回复一个字：n  或  否  或  拒绝  或  取消\n"
+                f"② 【命令兜底·万无一失】\n"
+                f"   复制发送：/mc_bind_confirm y   （同意）\n"
+                f"   复制发送：/mc_bind_confirm n   （拒绝）\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"⏳ {timeout_sec} 秒内有效；超时请在 MC 内重新 /bind。"
             )
             ok_private = False
             private_err = ""
@@ -945,8 +952,9 @@ class MCBridgePlugin(Star):
             if ok_private:
                 await self._tellraw_private(
                     sv, player,
-                    f"✅ [私聊通道] 已向 QQ {qq} 发送绑定确认，请对方私聊回复「同意」。"
-                    f"({int(self.config.get('BIND_CONFIRM_TIMEOUT', 300))}秒内有效)"
+                    f"✅ [私聊] 已向 QQ {qq} 发绑定确认。\n"
+                    f"对方回复 y/是/同意 即可，或发送 /mc_bind_confirm y。\n"
+                    f"（{timeout_sec}秒内有效）"
                 )
             else:
                 # 2) 失败则找共同群，群@确认
@@ -959,10 +967,11 @@ class MCBridgePlugin(Star):
                     if idx >= 3:
                         break
                     txt = (
-                        f"[CQ:at,qq={qq}] "
-                        f"【MC绑定二次确认】{display or player} [{sv.name}] 请求与你绑定。\n"
-                        f"同意/是/y 或 拒绝/否/n 以完成。\n"
-                        f"（或发送 /mc_bind_confirm y|n）"
+                        f"[CQ:at,qq={qq}] 【MC绑定二次确认】\n"
+                        f"MC玩家 {display or player} [{sv.name}] 请求把 MC 身份与你的 QQ 绑定。\n"
+                        f"【回复 y / 是 / 同意】确认绑定；【回复 n / 否 / 拒绝】取消。\n"
+                        f"如果直接回复无效，请复制发送：/mc_bind_confirm y  或  /mc_bind_confirm n\n"
+                        f"⏳ {timeout_sec} 秒内有效。"
                     )
                     try:
                         if await asyncio.wait_for(self._qq_send_to_group(g, txt), timeout=1.5):
@@ -2796,27 +2805,31 @@ class MCBridgePlugin(Star):
     CONFIRM_YES = {"同意", "确认", "是", "y", "好", "ok", "yes", "绑定"}
     CONFIRM_NO = {"拒绝", "否", "n", "no", "cancel", "取消"}
 
-    def _resolve_bind_confirmation(self, event: AstrMessageEvent, text: str):
-        """检查这条消息是否是某条待确认绑定的 同意/拒绝。命中返回 (token, is_accept)，否则返回 None."""
-        qq = str(event.get_sender_id() or "")
+    def _normalize_confirm_arg(self, arg: str) -> Optional[bool]:
+        """把字符串规范化为同意=True/拒绝=False/无法识别=None。忽略大小写和前后空白。"""
+        if arg is None:
+            return None
+        s = str(arg).strip()
+        if not s:
+            return None
+        lower = s.lower()
+        if lower in {x.lower() for x in self.CONFIRM_YES} or s in self.CONFIRM_YES:
+            return True
+        if lower in {x.lower() for x in self.CONFIRM_NO} or s in self.CONFIRM_NO:
+            return False
+        return None
+
+    def _find_pending_bind_by_qq(self, qq) -> Optional[str]:
+        """给定 QQ 号，找到它最新一条未超时的待确认绑定 token；找不到返回 None。
+        期间会自动清理超时条目。QQ 号强制转 str 比较，避免 int/str 不一致导致匹配失败。"""
+        qq = str(qq or "")
         if not qq:
             return None
-        lower = text.strip().lower()
-        stripped = text.strip()
-        is_confirm_word = (lower in self.CONFIRM_YES or lower in self.CONFIRM_NO or
-                           stripped in self.CONFIRM_YES or stripped in self.CONFIRM_NO)
-        if not is_confirm_word:
-            return None
-        is_accept = (lower in self.CONFIRM_YES) or (stripped in self.CONFIRM_YES)
-        logger.info(
-            f"[MCBridge] 绑定确认词匹配: qq={qq} text={text!r} accept={is_accept} "
-            f"pending_qqs={[info['qq'] for info in self._pending_binds.values()]}"
-        )
-        # 找该 QQ 最老一条未超时 pending
         now = time.time()
         best = None
         for tok, info in list(self._pending_binds.items()):
-            if info["qq"] != qq:
+            info_qq = str(info.get("qq", ""))
+            if info_qq != qq:
                 continue
             if now > info.get("timeout_at", 0):
                 self._pending_binds.pop(tok, None)
@@ -2824,11 +2837,100 @@ class MCBridgePlugin(Star):
                 continue
             if best is None or info["timeout_at"] < self._pending_binds[best]["timeout_at"]:
                 best = tok
-        if best is None:
-            logger.warning(f"[MCBridge] 绑定确认未找到匹配的pending: qq={qq}")
+        return best
+
+    def _resolve_bind_confirmation(self, event: AstrMessageEvent, text: str):
+        """检查这条消息是否是某条待确认绑定的 同意/拒绝。
+        命中返回 (token, is_accept)，否则返回 None。
+        同时兼容 message_str 原文（防止 CQ 码剥离不全导致 y 前面带空格/符号）。"""
+        qq = str(event.get_sender_id() or "")
+        if not qq:
             return None
-        logger.info(f"[MCBridge] 绑定确认匹配成功: token={best} qq={qq}")
-        return best, is_accept
+        # 候选文本：1) 传入的去 CQ 版 plain；2) 原始 message_str；3) 两条各自去前后空白+去CQ尾部
+        candidates: list[str] = []
+        for src in (text, getattr(event, "message_str", "") or ""):
+            if not src:
+                continue
+            candidates.append(src)
+            candidates.append(src.strip())
+            # 去掉开头可能残留的 [CQ:...] 标记后再提取首词（兼容群里@后回复y的情况）
+            cleaned = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", src).strip()
+            if cleaned and cleaned != src:
+                candidates.append(cleaned)
+                candidates.append(cleaned.split(None, 1)[0])
+        # 逐一尝试识别
+        is_accept: Optional[bool] = None
+        matched_text = None
+        for cand in candidates:
+            # 先整体匹配
+            r = self._normalize_confirm_arg(cand)
+            if r is not None:
+                is_accept = r
+                matched_text = cand
+                break
+            # 再取首词匹配（兼容 "y 好的" 或 "/mc_bind_confirm y" 这种带额外词的情况）
+            first = cand.split(None, 1)[0] if cand else ""
+            r2 = self._normalize_confirm_arg(first)
+            if r2 is not None:
+                is_accept = r2
+                matched_text = first
+                break
+        if is_accept is None:
+            return None
+        logger.info(
+            f"[MCBridge] 绑定确认词匹配: qq={qq} text={text!r} matched={matched_text!r} accept={is_accept} "
+            f"pending_qqs={[str(v.get('qq','')) for v in self._pending_binds.values()]}"
+        )
+        tok = self._find_pending_bind_by_qq(qq)
+        if tok is None:
+            logger.warning(
+                f"[MCBridge] 绑定确认命中了确认词 {matched_text!r}，但未找到该QQ({qq})的待确认绑定。"
+                f" pending_qqs={[str(v.get('qq','')) for v in self._pending_binds.values()]}"
+            )
+            return None
+        logger.info(f"[MCBridge] 绑定确认匹配成功: token={tok} qq={qq} accept={is_accept}")
+        return tok, is_accept
+
+    def _apply_bind_confirmation(self, tok: str, is_accept: bool) -> tuple[str, Optional[ServerCfg], str, bool]:
+        """公共方法：真正执行绑定确认（同意或拒绝）。
+        返回 (reply_txt, sv_or_None, player, did_bind)。
+        - 不负责发QQ消息 / yield；
+        - 不负责给MC发tellraw（由调用方 await _tellraw_private）；
+        - 不负责 stop_event。
+        这样 ALL 监听器 和 /mc_bind_confirm 命令 完全复用同一份逻辑，避免代码漂移。"""
+        info = self._pending_binds.pop(tok, None)
+        if info is None:
+            return "未找到待确认的MC绑定（可能已超时或已被处理）。请在MC内重新 /bind。", None, "", False
+        sv = self._servers.get(info.get("server", ""))
+        player = info.get("player", "")
+        if is_accept:
+            mc_id = info.get("mc_id", "")
+            qq = str(info.get("qq", ""))
+            if mc_id in self._bindings:
+                reply_txt = "绑定失败：该MC身份已被其他人先绑定。"
+                did_bind = False
+            elif qq in self._qq_to_mc:
+                reply_txt = "绑定失败：你的QQ号已绑定过另一个MC身份，请先 /unbind。"
+                did_bind = False
+            else:
+                self._bindings[mc_id] = qq
+                self._qq_to_mc = {v: k for k, v in self._bindings.items()}
+                self._binding_meta[mc_id] = {
+                    "server": info.get("server", ""),
+                    "player": info.get("player", ""),
+                    "player_uuid": info.get("player_uuid", ""),
+                    "display": info.get("display", ""),
+                }
+                self._save_bindings()
+                reply_txt = (
+                    f"✅ 绑定成功：MC[{info.get('server','')}] {info.get('display','')}"
+                    f"  ↔  QQ {qq}。记忆、印象、指令权限已互通。"
+                )
+                did_bind = True
+        else:
+            reply_txt = f"已拒绝绑定请求：MC玩家 {info.get('display','')}。"
+            did_bind = False
+        return reply_txt, sv, player, did_bind
 
     # ------ QQ侧解绑命令：/unbind （只有绑定玩家本人能发） ------
     @filter.command("unbind")
@@ -2844,8 +2946,8 @@ class MCBridgePlugin(Star):
         self._save_bindings()
         yield event.plain_result(f"✅ 已解除 MC身份 {mid} ↔ QQ {qq} 的绑定。")
 
-    # ------ 备选绑定确认命令：/mc_bind_confirm y|n|同意|拒绝 ------
-    # 当 event_message_type(ALL) 因某些原因未激活时，用户可通过此命令确认绑定
+    # ------ 绑定确认命令：/mc_bind_confirm y|n|同意|拒绝  以及  /确认绑定 y ------
+    # 与 ALL 监听器里的确认词识别共用同一套 apply 逻辑，避免代码漂移
     @filter.command("mc_bind_confirm")
     async def cmd_mc_bind_confirm(self, event: AstrMessageEvent, *args, **kwargs):
         qq = str(event.get_sender_id() or "")
@@ -2854,59 +2956,24 @@ class MCBridgePlugin(Star):
             return
         text = (getattr(event, "message_str", "") or "").strip()
         parts = text.split(maxsplit=1)
-        arg = (parts[1] if len(parts) > 1 else "").strip().lower()
-        if arg in self.CONFIRM_YES or arg in ("y", "同意", "确认", "是"):
-            is_accept = True
-        elif arg in self.CONFIRM_NO or arg in ("n", "拒绝", "否", "取消"):
-            is_accept = False
-        else:
+        arg = (parts[1] if len(parts) > 1 else "").strip()
+        is_accept = self._normalize_confirm_arg(arg)
+        if is_accept is None:
             yield event.plain_result(
                 "用法：/mc_bind_confirm y（同意）或 /mc_bind_confirm n（拒绝）\n"
-                "仅当有待确认的MC绑定时有效。"
+                "仅当有待确认的MC绑定时有效。\n"
+                "快捷：直接私聊回复 同意/是/y 或 拒绝/否/n 也可确认。"
             )
             return
-        # 查找该QQ号的 pending 绑定
-        now = time.time()
-        best = None
-        for tok, info in list(self._pending_binds.items()):
-            if info["qq"] != qq:
-                continue
-            if now > info.get("timeout_at", 0):
-                self._pending_binds.pop(tok, None)
-                continue
-            if best is None or info["timeout_at"] < self._pending_binds[best]["timeout_at"]:
-                best = tok
-        if best is None:
+        tok = self._find_pending_bind_by_qq(qq)
+        if tok is None:
             yield event.plain_result("未找到待确认的MC绑定（可能已超时）。请在MC内重新 /bind。")
             return
-        info = self._pending_binds.pop(best)
-        sv = self._servers.get(info.get("server", ""))
-        player = info.get("player", "")
-        if is_accept:
-            mc_id = info.get("mc_id", "")
-            if mc_id in self._bindings:
-                reply_txt = "绑定失败：该MC身份已被其他人先绑定。"
-            elif qq in self._qq_to_mc:
-                reply_txt = "绑定失败：你的QQ号已绑定过另一个MC身份，请先 /unbind。"
-            else:
-                self._bindings[mc_id] = qq
-                self._binding_meta[mc_id] = {
-                    "server": info.get("server", ""),
-                    "player": info.get("player", ""),
-                    "player_uuid": info.get("player_uuid", ""),
-                    "display": info.get("display", ""),
-                }
-                self._save_bindings()
-                reply_txt = (
-                    f"✅ 绑定成功：MC[{info.get('server','')}] {info.get('display','')}"
-                    f"  ↔  QQ {qq}。记忆、印象、指令权限已互通。"
-                )
-        else:
-            reply_txt = f"已拒绝绑定请求：MC玩家 {info.get('display','')}。"
+        reply_txt, sv, player, did_bind = self._apply_bind_confirmation(tok, is_accept)
         if sv and player:
             await self._tellraw_private(
                 sv, player,
-                reply_txt if is_accept else "QQ方拒绝了绑定请求。"
+                reply_txt if did_bind or not is_accept else "QQ方拒绝了绑定请求。"
             )
         yield event.plain_result(reply_txt)
 
@@ -2938,8 +3005,11 @@ class MCBridgePlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     # ---- 最核心：QQ 全消息旁路监听（仅旁听、不拦截） @filter.event_message_type(ALL) ----
+    # 签名与主目录 main.py 的 on_message 对齐：只有 event 参数（不加 *args, **kwargs）。
+    # 返回响应时遵循 make_result() -> result.message()/reply() -> result.stop_event() -> yield result
+    # 的标准构造方式（参考 主目录main.py _make_warn_result 模式），确保拦截生效。
     @filter.event_message_type(filter.EventMessageType.ALL, priority=30)
-    async def on_qq_all_messages(self, event: AstrMessageEvent, *args, **kwargs):
+    async def on_qq_all_messages(self, event: AstrMessageEvent):
         # 1) 缓存 bot 引用（旁路缓存，不影响正常处理）
         try:
             await self._cache_bot_from_event(event)
@@ -2965,66 +3035,68 @@ class MCBridgePlugin(Star):
         )
 
         # 2) 二次确认绑定（优先处理：若命中就直接消耗掉，不记录为记忆；但仍会通知MC结果）
+        # —— 使用标准 MessageEventResult 构造方式：event.make_result() + result.stop_event() + yield result
+        bind_result_obj = None
         try:
             bind_res = self._resolve_bind_confirmation(event, plain or "")
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[MCBridge] 绑定确认解析异常: {e}")
             bind_res = None
         if bind_res is not None:
             tok, is_accept = bind_res
-            info = self._pending_binds.pop(tok, None)
-            if info is not None:
-                sv = self._servers.get(info.get("server", ""))
-                player = info.get("player", "")
-                if is_accept:
-                    mc_id = info.get("mc_id", "")
-                    qq = info.get("qq", "")
-                    # 再校验一次防重复
-                    if mc_id in self._bindings:
-                        reply_txt = "绑定失败：该MC身份已被其他人先绑定。"
-                    elif qq in self._qq_to_mc:
-                        reply_txt = "绑定失败：你的QQ号已绑定过另一个MC身份，请先 /unbind。"
-                    else:
-                        self._bindings[mc_id] = qq
-                        # 写入绑定元数据：mid -> {server, player, player_uuid, display}；供QQ→MC回复推送反查
-                        self._binding_meta[mc_id] = {
-                            "server": info.get("server", ""),
-                            "player": info.get("player", ""),
-                            "player_uuid": info.get("player_uuid", ""),
-                            "display": info.get("display", ""),
-                        }
-                        self._save_bindings()
-                        reply_txt = (
-                            f"✅ 绑定成功：MC[{info.get('server','')}] {info.get('display','')}"
-                            f"  ↔  QQ {qq}。记忆、印象、指令权限已互通。"
+            reply_txt, sv, player, did_bind = self._apply_bind_confirmation(tok, is_accept)
+            # 绑定成功时写入 memory_companion 系统事件（之前内嵌的逻辑）
+            if did_bind:
+                info_meta = self._binding_meta.get(
+                    # apply 后 meta 已经写入，反查 mc_id: key 是最后一个写入 mc_id → 从 qq_to_mc 查
+                    self._qq_to_mc.get(str(sender_id or "")),
+                    {},
+                )
+                mc_id_for_mem = self._qq_to_mc.get(str(sender_id or ""), "")
+                if bool(self.config.get("ENABLE_SYNC_TO_MEMORY_COMPANION", True)) and sender_id:
+                    self._spawn(
+                        self._buffer_and_sync_memory(
+                            None,
+                            self._qq_to_user_key(sender_id),
+                            sender_id,
+                            sender_name or info_meta.get("display", ""),
+                            f"[系统] MC身份 {mc_id_for_mem} 与本QQ号绑定完成（权限/记忆互通）",
+                            "system",
+                            platform="qq",
+                            qq_number=sender_id,
+                            session_id=self._qq_session_id(event),
+                            group_id=group_id, group_name=group_name,
                         )
-                        # 写一条 memory_companion 系统事件
-                        if bool(self.config.get("ENABLE_SYNC_TO_MEMORY_COMPANION", True)):
-                            self._spawn(
-                                self._buffer_and_sync_memory(
-                                    None,
-                                    self._qq_to_user_key(qq),
-                                    qq,
-                                    sender_name or info.get("display", ""),
-                                    f"[系统] MC身份 {mc_id} 与本QQ号绑定完成（权限/记忆互通）",
-                                    "system",
-                                    platform="qq",
-                                    qq_number=qq,
-                                    session_id=self._qq_session_id(event),
-                                    group_id=group_id, group_name=group_name,
-                                )
-                            )
-                else:
-                    reply_txt = f"已拒绝绑定请求：MC玩家 {info.get('display','')}。"
-                # 回执给MC玩家 tellraw 私发
-                if sv and player:
+                    )
+            # 回执给 MC 玩家 tellraw 私发
+            if sv and player:
+                try:
                     await self._tellraw_private(
                         sv, player,
-                        reply_txt if is_accept else "QQ方拒绝了绑定请求。"
+                        reply_txt if did_bind or not is_accept else "QQ方拒绝了绑定请求。"
                     )
-                # stop_event 彻底阻止后续 handler 和 LLM pipeline
-                event.stop_event()
-                yield event.plain_result(reply_txt)
-                return
+                except Exception as e:
+                    logger.warning(f"[MCBridge] 绑定回执 MC tellraw 失败: {e}")
+            # ★ 标准拦截响应构造（与主目录 main.py _make_warn_result 完全对齐）：
+            #   event.make_result() 创建 result → 设置消息 → result.stop_event() 标记拦截 → yield result
+            result = event.make_result()
+            try:
+                # 优先 reply 引用用户的确认消息，让用户一眼看到是自己的 "y" 被处理了
+                if hasattr(event, "message_id"):
+                    mid_val = getattr(event, "message_id", None)
+                    if mid_val is not None:
+                        result.reply(str(mid_val), " ")
+            except Exception:
+                pass
+            result.message(reply_txt)
+            # stop_event 是在 result 对象上调用，不是 event！（这是之前无反应的核心根因）
+            result.stop_event()
+            bind_result_obj = result
+
+        if bind_result_obj is not None:
+            logger.info(f"[MCBridge] 绑定确认已拦截响应: {reply_txt!r}")
+            yield bind_result_obj
+            return
 
         # 若是 AstrBot 系统命令（以 / 开头），不写入记忆（但 /mc_forward /unbind /mc_bindings 被上层 command 处理，这里不拦）
         # 注意：command 装饰器优先于 event_message_type(ALL) 执行，所以这里只拿到执行后的旁路事件。
