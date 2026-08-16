@@ -931,7 +931,8 @@ class MCBridgePlugin(Star):
                 f"【身份绑定二次确认】\n"
                 f"玩家 [{sv.name}] {display or player} 尝试把MC身份与你的QQ号绑定。\n"
                 f"确认请回复：同意 / 是 / y / 确认\n"
-                f"拒绝请回复：拒绝 / 否 / n / cancel"
+                f"拒绝请回复：拒绝 / 否 / n / cancel\n"
+                f"（如直接回复无效，请发送：/mc_bind_confirm y 或 /mc_bind_confirm n）"
             )
             ok_private = False
             private_err = ""
@@ -960,7 +961,8 @@ class MCBridgePlugin(Star):
                     txt = (
                         f"[CQ:at,qq={qq}] "
                         f"【MC绑定二次确认】{display or player} [{sv.name}] 请求与你绑定。\n"
-                        f"同意/是/y 或 拒绝/否/n 以完成。"
+                        f"同意/是/y 或 拒绝/否/n 以完成。\n"
+                        f"（或发送 /mc_bind_confirm y|n）"
                     )
                     try:
                         if await asyncio.wait_for(self._qq_send_to_group(g, txt), timeout=1.5):
@@ -1089,19 +1091,28 @@ class MCBridgePlugin(Star):
             self._exec_futures.pop(request_id, None)
             return "[Bridge 执行超时(10s)]"
 
+    def _build_blacklist_regex(self) -> str:
+        """从配置构建黑名单正则。配置项 NL_COMMAND_BLACKLIST 为逗号分隔的关键词列表。"""
+        raw = str(self.config.get("NL_COMMAND_BLACKLIST", "stop,restart,shutdown,ban,ban-ip,pardon,op,deop,whitelist") or "")
+        words = [w.strip() for w in raw.split(",") if w.strip()]
+        if not words:
+            return r"(?!)"  # 空黑名单：永不匹配
+        # 转义并拼接为 \b(word1|word2|...)\b
+        escaped = "|".join(re.escape(w) for w in words)
+        return r"\b(" + escaped + r")\b"
+
     async def _mc_nl_route_with_llm(self, sv: ServerCfg, player: str, display: str, content: str, perm: str, forced: bool) -> dict:
         """LLM路由：返回 {action: 'deny'|'execute_safe'|'not_command', ...}。
 
-        危险指令关键词清单（仅阻断服务器安全级操作）：
-          服管：stop / restart / shutdown
-          封禁/权限：ban / ban-ip / pardon / op / deop / whitelist
-        give/gamemode/tp/summon/setblock/fill/clone/effect/clear 等不阻断（由LLM根据权限等级决定）。
+        黑名单关键词来自配置 NL_COMMAND_BLACKLIST（默认 stop/restart/shutdown/ban/ban-ip/pardon/op/deop/whitelist）。
+        黑名单内的指令会被拒绝并提示用直接命令。其余指令由LLM根据权限等级决定。
 
         【关键设计】：该调用走 _llm_generate_clean(skip_persona=True)，
         不叠加 AstrBot 默认 persona、印象、记忆等钩子，避免模型输出"我不是仓库管理员"
         这类与指令路由任务完全无关的、来自聊天人设立场的拒绝。
         """
-        dangerous = r"\b(stop|restart|shutdown|ban|ban-ip|pardon|op|deop|whitelist)\b"
+        dangerous = self._build_blacklist_regex()
+        blacklist_display = str(self.config.get("NL_COMMAND_BLACKLIST", "stop,restart,shutdown,ban,ban-ip,pardon,op,deop,whitelist") or "")
         MUST_HAVE_HINT = "请直接使用游戏内命令（非自然语言）"
         ROLE_PROMPT = (
             "你是 Minecraft 服务器的「指令路由器」，不是聊天助手，也不是玩家的朋友或管家。"
@@ -1111,7 +1122,7 @@ class MCBridgePlugin(Star):
         lines = [
             "任务：把玩家的自然语言请求，判定为以下 3 种动作之一，并用 JSON 输出。",
             "动作1：execute_safe = 可执行指令（time/weather/help/list/me/say/tp/give/gamemode/summon/setblock/fill/clone/effect/clear 等常规游戏指令），必须输出一条具体的 Minecraft 命令。",
-            f"动作2：deny = 危险指令（仅 stop/restart/shutdown/ban/ban-ip/pardon/op/deop/whitelist 等服务器安全级操作），用自然语言写一段礼貌的拒绝说明，并且 message 结尾必须包含「{MUST_HAVE_HINT}」。",
+            f"动作2：deny = 黑名单指令（{blacklist_display}），用自然语言写一段礼貌的拒绝说明，并且 message 结尾必须包含「{MUST_HAVE_HINT}」。",
             '动作3：not_command = 这不是指令意图，只是普通闲聊（如"今天天气不错"/"你好"），或你无法识别为可执行 MC 指令的请求，输出 message 字段简短解释为什么不是指令。',
             f"当前玩家权限等级={perm}（仅 superadmin/admin 能做更重操作，member 只能做查询/自操作，unbound 不允许执行）。",
             f"玩家={display or player}, 服务器={sv.name}",
@@ -1547,6 +1558,33 @@ class MCBridgePlugin(Star):
             f"请你用 {sv.bot_name} 的身份，结合聊天上下文用一句简短自然的口语回复。"
             f"不要加名字前缀，直接输出回复内容即可；允许使用换行符。"
         )
+        # ---- LLM 自主使用MC指令能力 ----
+        perm = self._permission_for(sv, player, player_uuid)
+        if bool(self.config.get("ENABLE_LLM_AUTONOMOUS_ACTION", True)) and perm in ("admin", "superadmin"):
+            blacklist_display = str(self.config.get("NL_COMMAND_BLACKLIST", "") or "")
+            lines.append("")
+            lines.append("【自主指令能力】")
+            lines.append(
+                "你可以在回复中嵌入 MC 指令来自主执行操作，格式为：[MC_CMD: /指令 参数]"
+            )
+            lines.append(
+                "你可以在一条回复中嵌入多个指令标记。指令会在回复发送后自动执行。"
+            )
+            lines.append(
+                "你可以使用的指令示例：/kick <玩家> <原因>、/mute <玩家> <时长>、"
+                "/tp <玩家1> <玩家2>、/gamemode <模式> <玩家>、/give <玩家> <物品> <数量>、"
+                "/time set day|night、/weather clear|rain|thunder、/say <消息> 等。"
+            )
+            lines.append(
+                "何时自主使用指令：当你被辱骂/挑衅/惹怒时，可以踢出或禁言对方；"
+                "当玩家请求帮助（如传送）时，可以执行tp；当有人破坏秩序时，可以及时干预。"
+            )
+            lines.append(
+                "注意：指令标记不会显示给玩家，只执行指令。你的回复文本会正常显示。"
+            )
+            if blacklist_display:
+                lines.append(f"以下指令被黑名单禁止（无法执行）：{blacklist_display}")
+            lines.append(f"你的权限等级={perm}，可以执行管理类指令。")
         prompt_parts = ["\n".join(lines)]
         if cross_parts:
             prompt_parts.extend(cross_parts)
@@ -1555,7 +1593,49 @@ class MCBridgePlugin(Star):
         reply = await self._llm_generate_text(prompt, sp)
         if not reply:
             return None
-        return reply.strip().strip('"').strip("'") or None
+        reply = reply.strip().strip('"').strip("'") or None
+        if not reply:
+            return None
+        # ---- 解析并执行LLM嵌入的自主指令标记 ----
+        if bool(self.config.get("ENABLE_LLM_AUTONOMOUS_ACTION", True)):
+            reply = await self._extract_and_execute_autonomous_cmds(sv, player, player_uuid, reply, perm)
+        return reply
+
+    async def _extract_and_execute_autonomous_cmds(self, sv: ServerCfg, player: str, player_uuid: str, reply: str, perm: str) -> str:
+        """从LLM回复中提取 [MC_CMD: /xxx] 标记，执行指令，并从回复文本中移除标记。
+        黑名单指令不执行。仅 admin/superadmin 权限的绑定玩家可用。"""
+        if not reply:
+            return reply
+        # 匹配所有 [MC_CMD: ...] 标记
+        cmd_pattern = re.compile(r"\[MC_CMD:\s*(/?[^\]]+?)\s*\]")
+        matches = cmd_pattern.findall(reply)
+        if not matches:
+            return reply
+        dangerous = self._build_blacklist_regex()
+        for raw_cmd in matches:
+            cmd = raw_cmd.strip()
+            if not cmd.startswith("/"):
+                cmd = "/" + cmd
+            # 黑名单检查
+            if re.search(dangerous, cmd, re.I):
+                logger.warning(f"[MCBridge][{sv.name}] LLM自主指令被黑名单拦截: {cmd}")
+                continue
+            # 权限检查：仅 admin/superadmin 可自主执行
+            if perm not in ("admin", "superadmin"):
+                logger.warning(f"[MCBridge][{sv.name}] LLM自主指令权限不足(perm={perm}): {cmd}")
+                continue
+            logger.info(f"[MCBridge][{sv.name}] LLM自主执行指令: {cmd} (player={player} perm={perm})")
+            try:
+                out = await self._exec_and_capture_output(sv, cmd)
+                if out:
+                    logger.info(f"[MCBridge][{sv.name}] LLM自主指令输出: {out[:200]}")
+            except Exception as e:
+                logger.warning(f"[MCBridge][{sv.name}] LLM自主指令执行失败: {cmd} -> {e}")
+        # 从回复文本中移除所有指令标记
+        cleaned = cmd_pattern.sub("", reply).strip()
+        # 清理多余空行
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned if cleaned else reply
 
     async def _push_reply_to_qq_if_bound(self, sv: ServerCfg, player: str, player_uuid: str, reply: str):
         """如果MC玩家绑定了QQ，把bot回复也推到QQ私聊（双向同步）。"""
@@ -2722,10 +2802,16 @@ class MCBridgePlugin(Star):
         if not qq:
             return None
         lower = text.strip().lower()
-        if not (lower in self.CONFIRM_YES or lower in self.CONFIRM_NO or
-                text.strip() in self.CONFIRM_YES or text.strip() in self.CONFIRM_NO):
+        stripped = text.strip()
+        is_confirm_word = (lower in self.CONFIRM_YES or lower in self.CONFIRM_NO or
+                           stripped in self.CONFIRM_YES or stripped in self.CONFIRM_NO)
+        if not is_confirm_word:
             return None
-        is_accept = (lower in self.CONFIRM_YES) or (text.strip() in self.CONFIRM_YES)
+        is_accept = (lower in self.CONFIRM_YES) or (stripped in self.CONFIRM_YES)
+        logger.info(
+            f"[MCBridge] 绑定确认词匹配: qq={qq} text={text!r} accept={is_accept} "
+            f"pending_qqs={[info['qq'] for info in self._pending_binds.values()]}"
+        )
         # 找该 QQ 最老一条未超时 pending
         now = time.time()
         best = None
@@ -2734,11 +2820,14 @@ class MCBridgePlugin(Star):
                 continue
             if now > info.get("timeout_at", 0):
                 self._pending_binds.pop(tok, None)
+                logger.warning(f"[MCBridge] 绑定确认超时已清理: token={tok} qq={qq}")
                 continue
             if best is None or info["timeout_at"] < self._pending_binds[best]["timeout_at"]:
                 best = tok
         if best is None:
+            logger.warning(f"[MCBridge] 绑定确认未找到匹配的pending: qq={qq}")
             return None
+        logger.info(f"[MCBridge] 绑定确认匹配成功: token={best} qq={qq}")
         return best, is_accept
 
     # ------ QQ侧解绑命令：/unbind （只有绑定玩家本人能发） ------
@@ -2754,6 +2843,72 @@ class MCBridgePlugin(Star):
         self._bindings.pop(mid, None)
         self._save_bindings()
         yield event.plain_result(f"✅ 已解除 MC身份 {mid} ↔ QQ {qq} 的绑定。")
+
+    # ------ 备选绑定确认命令：/mc_bind_confirm y|n|同意|拒绝 ------
+    # 当 event_message_type(ALL) 因某些原因未激活时，用户可通过此命令确认绑定
+    @filter.command("mc_bind_confirm")
+    async def cmd_mc_bind_confirm(self, event: AstrMessageEvent, *args, **kwargs):
+        qq = str(event.get_sender_id() or "")
+        if not qq:
+            yield event.plain_result("无法获取你的QQ号。")
+            return
+        text = (getattr(event, "message_str", "") or "").strip()
+        parts = text.split(maxsplit=1)
+        arg = (parts[1] if len(parts) > 1 else "").strip().lower()
+        if arg in self.CONFIRM_YES or arg in ("y", "同意", "确认", "是"):
+            is_accept = True
+        elif arg in self.CONFIRM_NO or arg in ("n", "拒绝", "否", "取消"):
+            is_accept = False
+        else:
+            yield event.plain_result(
+                "用法：/mc_bind_confirm y（同意）或 /mc_bind_confirm n（拒绝）\n"
+                "仅当有待确认的MC绑定时有效。"
+            )
+            return
+        # 查找该QQ号的 pending 绑定
+        now = time.time()
+        best = None
+        for tok, info in list(self._pending_binds.items()):
+            if info["qq"] != qq:
+                continue
+            if now > info.get("timeout_at", 0):
+                self._pending_binds.pop(tok, None)
+                continue
+            if best is None or info["timeout_at"] < self._pending_binds[best]["timeout_at"]:
+                best = tok
+        if best is None:
+            yield event.plain_result("未找到待确认的MC绑定（可能已超时）。请在MC内重新 /bind。")
+            return
+        info = self._pending_binds.pop(best)
+        sv = self._servers.get(info.get("server", ""))
+        player = info.get("player", "")
+        if is_accept:
+            mc_id = info.get("mc_id", "")
+            if mc_id in self._bindings:
+                reply_txt = "绑定失败：该MC身份已被其他人先绑定。"
+            elif qq in self._qq_to_mc:
+                reply_txt = "绑定失败：你的QQ号已绑定过另一个MC身份，请先 /unbind。"
+            else:
+                self._bindings[mc_id] = qq
+                self._binding_meta[mc_id] = {
+                    "server": info.get("server", ""),
+                    "player": info.get("player", ""),
+                    "player_uuid": info.get("player_uuid", ""),
+                    "display": info.get("display", ""),
+                }
+                self._save_bindings()
+                reply_txt = (
+                    f"✅ 绑定成功：MC[{info.get('server','')}] {info.get('display','')}"
+                    f"  ↔  QQ {qq}。记忆、印象、指令权限已互通。"
+                )
+        else:
+            reply_txt = f"已拒绝绑定请求：MC玩家 {info.get('display','')}。"
+        if sv and player:
+            await self._tellraw_private(
+                sv, player,
+                reply_txt if is_accept else "QQ方拒绝了绑定请求。"
+            )
+        yield event.plain_result(reply_txt)
 
     # ------ /mc_bindings   (ADMIN) 查看绑定表 ------
     @filter.command("mc_bindings")
@@ -2802,6 +2957,12 @@ class MCBridgePlugin(Star):
                 is_private = bool(event.is_private_chat())
         except Exception:
             is_private = not bool(group_id)
+
+        # 诊断日志：确认 ALL handler 被激活并收到消息
+        logger.info(
+            f"[MCBridge] ALL handler 收到消息: sender={sender_id} private={is_private} "
+            f"group={group_id} plain={plain!r} pending_binds={len(self._pending_binds)}"
+        )
 
         # 2) 二次确认绑定（优先处理：若命中就直接消耗掉，不记录为记忆；但仍会通知MC结果）
         try:
@@ -2860,13 +3021,15 @@ class MCBridgePlugin(Star):
                         sv, player,
                         reply_txt if is_accept else "QQ方拒绝了绑定请求。"
                     )
+                # stop_event 彻底阻止后续 handler 和 LLM pipeline
+                event.stop_event()
                 yield event.plain_result(reply_txt)
                 return
 
         # 若是 AstrBot 系统命令（以 / 开头），不写入记忆（但 /mc_forward /unbind /mc_bindings 被上层 command 处理，这里不拦）
         # 注意：command 装饰器优先于 event_message_type(ALL) 执行，所以这里只拿到执行后的旁路事件。
         # 但是部分版本也可能会经过 all 监听器再进 command，因此用"如果是 /mc 系列 /mc_forward /unbind /mc_bindings /mc_confirm 就跳过记忆"
-        if re.match(r"^\s*/(mc|mc_bridge|mc_confirm|mc_forward|mc_bindings|unbind)(\s|$)", plain or ""):
+        if re.match(r"^\s*/(mc|mc_bridge|mc_confirm|mc_bind_confirm|mc_forward|mc_bindings|unbind)(\s|$)", plain or ""):
             return
 
         # 3) 记录 QQ 会话 + 写入 memory_companion / impression

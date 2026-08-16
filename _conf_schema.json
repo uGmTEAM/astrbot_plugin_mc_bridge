@@ -156,6 +156,8 @@
     "CMD_NL_COOLDOWN": {"description": "【指令】MC玩家自然语言/ai指令的独立冷却时间(秒)，防止快速连续执行。普通聊天回复不共用此冷却。", "type": "int", "default": 15},
     "ENABLE_NL_COMMAND_AUTO_DETECT": {"description": "【指令】MC玩家正常聊天消息里，是否自动识别指令意图（不强制/ai前缀，绑定玩家才能用）。危险指令会由LLM生成拒绝并提示用直接指令。关闭后必须 /ai <内容> 才会被当作指令。", "type": "bool", "default": true},
     "ENABLE_MC_NL_COMMAND": {"description": "【指令】是否启用MC内自然语言指令通道。关闭后玩家只能走MC端插件/ai 前缀命令或 AstrBot /mc 命令。", "type": "bool", "default": true},
+    "NL_COMMAND_BLACKLIST": {"description": "【指令】自然语言指令黑名单（逗号分隔）。匹配到这些关键词的指令会被拒绝并提示用直接命令。默认阻断服务器安全级操作。", "type": "string", "default": "stop,restart,shutdown,ban,ban-ip,pardon,op,deop,whitelist"},
+    "ENABLE_LLM_AUTONOMOUS_ACTION": {"description": "【指令】是否允许LLM在聊天中自主决定使用MC指令（如被惹怒时踢出玩家、被辱骂时禁言）。开启后LLM可在回复中嵌入指令标记自动执行。权限跟随绑定QQ号等级。", "type": "bool", "default": true},
     "ENABLE_FORWARD_MC_TO_QQ": {"description": "【消息桥】总开关：是否把MC玩家聊天按 FORWARD_GROUPS + /mc_forward 动态订阅转发到QQ群。关闭后记忆仍同步，只是不发群消息。", "type": "bool", "default": true},
     "BIND_CONFIRM_TIMEOUT": {"description": "【绑定】玩家执行 /bind <QQ号> 后，等待QQ方真人确认的超时时间(秒)。超时自动取消绑定请求。", "type": "int", "default": 300},
     "FORWARD_FMT_MC_TO_QQ": {"description": "【消息桥】MC聊天转发到QQ群的文本格式。占位符: {server}=服名, {player}=玩家ID, {display}=显示名, {message}=消息正文, {time}=HH:MM:SS", "type": "string", "default": "[MC|{server}] <{display}> {message}"},
