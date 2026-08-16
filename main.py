@@ -198,18 +198,16 @@ class MCBridgePlugin(Star):
         self._cached_bot: Optional[Any] = None
         self._cached_platform_id: str = ""
 
-        # --------- v3.1 新增：正向回传队列（解决"反向桥不通→玩家没下文"）---------
-        # key = server_name；value = list[ {player: str, msg: str, level: "info"|"error"|"success", ts: float} ]
-        # 如果 AstrBot → MC 的 bridge/rcon 回 tellraw 失败，就把回执塞进这里。
-        # 下一次 Java 端 POST /mc_chat 时，_handle_mc_chat 会取出匹配该服/该玩家的 pending，
-        # 通过 HTTP 响应体 pending_messages[] 一并带回 Java 端，由 Java 端直接 player.sendMessage 显示。
-        # 这保证了：无论反向桥通不通，命令都有"下文"。
-        self._reply_pending: dict[str, list[dict]] = {}
-        self._reply_pending_lock = asyncio.Lock()
+        # --------- WebSocket 连接管理（MC端主动连过来，双向实时通讯）---------
+        # key = server_name；value = {"ws": WebSocketResponse, "online_mode": bool}
+        self._ws_connections: dict[str, dict] = {}
+        # 等待 execute_result 的 future（_exec_and_capture_output 用）
+        # key = request_id；value = asyncio.Future
+        self._exec_futures: dict[str, asyncio.Future] = {}
 
         self._lock = asyncio.Lock()
         self._rcon_locks: dict[str, asyncio.Lock] = {}
-        self._http_runners: list[tuple] = []  # (runner, site, port)
+        self._http_runners: list[tuple] = []  # aiohttp AppRunner/TCPSite（WS server 复用）
         self._client_session: Optional[aiohttp.ClientSession] = None
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -217,16 +215,16 @@ class MCBridgePlugin(Star):
 
     async def initialize(self):
         if aiohttp is None:
-            logger.error("[MCBridge] 缺少依赖 aiohttp，无法启动 HTTP 接收/回传通道")
+            logger.error("[MCBridge] 缺少依赖 aiohttp，无法启动 WebSocket 服务")
             return
         if not self._servers:
             logger.warning("[MCBridge] 未配置任何服务器，请在插件配置 SERVERS 中填写列表")
             return
-        await self._start_http_servers()
+        await self._start_ws_server()
         for s in self._servers.values():
             logger.info(
-                f"[MCBridge] 已接入服务器 [{s.name}] (host={s.host} listen=:{s.listen_port} "
-                f"channel={s.send_channel} online_mode={s.online_mode})"
+                f"[MCBridge] 等待 MC 服务器 [{s.name}] 连接 (listen=:{s.listen_port} "
+                f"online_mode={s.online_mode})"
             )
         # 注册 LLM 工具
         if bool(self.config.get("ENABLE_NATURAL_LANGUAGE_TOOL", True)):
@@ -241,6 +239,21 @@ class MCBridgePlugin(Star):
         for t in list(self._bg_tasks):
             t.cancel()
         self._bg_tasks.clear()
+        # 关闭所有 WS 连接
+        for name, info in list(self._ws_connections.items()):
+            ws = info.get("ws")
+            if ws is not None and not ws.closed:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        self._ws_connections.clear()
+        # 取消所有等待 execute_result 的 future
+        for fut in self._exec_futures.values():
+            if not fut.done():
+                fut.cancel()
+        self._exec_futures.clear()
+        # 清理 aiohttp runner/site
         for runner, site, _port in self._http_runners:
             try:
                 await site.stop()
@@ -372,227 +385,130 @@ class MCBridgePlugin(Star):
             return f"{plat}:FriendMessage:{user_id}"
         return f"{plat}:GroupMessage:{group_id}"
 
-    # ------------------------------------------------------------------ HTTP 接收服务（每台服务器一个 aiohttp Site，按 listen_port 区分来源）
+    # ------------------------------------------------------------------ WebSocket 服务（MC端主动连过来，双向实时通讯；不再有反向HTTP通道和pending队列）
 
-    async def _start_http_servers(self):
+    async def _start_ws_server(self):
         host = str(self.config.get("ASTRBOT_LISTEN_HOST", "0.0.0.0") or "0.0.0.0").strip()
-        # 去重：同一个 listen_port 只启动一次 app，避免 AstrBot 插件热加载后重复监听同一个端口导致"Address already in use"
-        # （MC 端 config.yml 默认 astrbot_port=6188，用户多台服共用 AstrBot 监听一个端口也很常见）
-        # key = (host, port)；value = (app, runner, site)
+        # 去重：同一个 listen_port 只启动一次 app，避免插件热加载后重复监听同一端口导致 "Address already in use"
         started_sites: dict[tuple[str, int], tuple] = {}
-        # port -> list[sv_name]：一个 port 可能匹配多个服务器名，请求时根据 server_name_report 或 握手映射找 sv
-        self._port_to_svs: dict[int, list[ServerCfg]] = {}
-        # mc_identity / handshake 过来的上报 server_name -> ServerCfg（/mc_chat 请求里带 server_name 时能找到正确 sv）
-        self._name_to_sv: dict[str, ServerCfg] = {
-            s.name: s for s in self._servers.values()
-        }
-
-        def _attach_routes(app: web.Application, port: int):
-            """给某个 port 共用的 app 挂上三条路由，handler 内部再根据请求内容找对应 ServerCfg。"""
-            async def h_mc_chat(request):
-                # 先根据握手映射/report 匹配具体 server
-                try:
-                    data = await request.json()
-                except Exception:
-                    return web.json_response({"ok": False, "error": "bad json"}, status=400)
-                reported = str(data.get("server_name", "") or "").strip()
-                sv = None
-                if reported and reported in self._name_to_sv:
-                    sv = self._name_to_sv[reported]
-                if sv is None:
-                    # fallback：该 port 下挂的第一个服
-                    candidates = self._port_to_svs.get(port, [])
-                    if candidates:
-                        sv = candidates[0]
-                if sv is None:
-                    # 最后兜底：任意一个已知服（_check_token 会再过滤）
-                    sv = next(iter(self._servers.values()), None)
-                if sv is None:
-                    return web.json_response({"ok": False, "error": "no server cfg"}, status=503)
-                return await self._handle_mc_chat(request, sv)
-
-            async def h_mc_handshake(request):
-                candidates = self._port_to_svs.get(port, [])
-                sv = candidates[0] if candidates else next(iter(self._servers.values()), None)
-                if sv is None:
-                    return web.json_response({"ok": False, "error": "no server cfg"}, status=503)
-                resp = await self._handle_mc_handshake(request, sv)
-                # 握手成功后：如果上报了 server_name，建立 server_name -> 本 sv 的映射（即使和配置里 name 不同也 OK）
-                try:
-                    body = await request.json()
-                    reported = str((body or {}).get("server_name", "") or "").strip()
-                    if reported and reported not in self._name_to_sv:
-                        self._name_to_sv[reported] = sv
-                except Exception:
-                    pass
-                return resp
-
-            async def h_status(request):
-                candidates = self._port_to_svs.get(port, [])
-                sv = candidates[0] if candidates else next(iter(self._servers.values()), None)
-                if sv is None:
-                    return web.json_response({"ok": False, "error": "no server cfg"}, status=503)
-                return await self._handle_status(request, sv)
-
-            app.router.add_post("/mc_chat", h_mc_chat)
-            app.router.add_post("/mc_handshake", h_mc_handshake)
-            app.router.add_get("/status", h_status)
-            # 兜底：任何路径返回结构化 404，便于 Java 端快速识别"端口上不是我们的服务（比如 FastAPI 没有 /mc_chat）"
-            async def _catch_all(request):
-                return web.json_response({
-                    "ok": False,
-                    "error": f"mc_bridge: unknown path {request.path!r} (请检查 MC 端 astrbot_port 是否填对)",
-                    "hint": "正确路径: POST /mc_chat, POST /mc_handshake, GET /status",
-                }, status=404)
-            app.router.add_route("*", "/{tail:.*}", _catch_all)
-
         for sv in self._servers.values():
             port_key = (host, sv.listen_port)
-            self._port_to_svs.setdefault(sv.listen_port, []).append(sv)
             if port_key in started_sites:
-                # 此端口已被其他服共用 app，跳过，不必再启动
                 logger.info(
-                    f"[MCBridge] 服务器[{sv.name}] 复用已启动的 HTTP 监听 {host}:{sv.listen_port} "
-                    f"(共用 {len(self._port_to_svs[sv.listen_port])} 台服务器)"
+                    f"[MCBridge] 服务器[{sv.name}] 复用已启动的 WS 监听 {host}:{sv.listen_port}"
                 )
                 continue
             app = web.Application()
-            _attach_routes(app, sv.listen_port)
+            app.router.add_get("/mc_ws", self._handle_ws)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, host, sv.listen_port)
             try:
                 await site.start()
             except Exception as e:
-                # 致命：端口被别人占了 → 只打后台日志，不给玩家塞 pending（避免前台噪音）
+                # 端口启动失败只 logger.error，不再塞 pending（pending已删）
                 logger.error(
-                    f"[MCBridge] 服务器[{sv.name}] HTTP 监听 {host}:{sv.listen_port} 失败: {e!r}. "
-                    f"**这会导致 MC 端所有命令(含/bind)看起来只有「正在处理」没有下文**！"
-                    f"解决：1) lsof -i :{sv.listen_port} 或 ss -tlnp | grep :{sv.listen_port} 找到占用进程并 kill；"
-                    f"2) 或者在 AstrBot 插件配置 SERVERS 里把 listen_port 改成未占用端口，并同步修改 MC 端 config.yml 的 astrbot_port。"
+                    f"[MCBridge] 服务器[{sv.name}] WS 监听 {host}:{sv.listen_port} 失败: {e!r}. "
+                    f"**这会导致 MC 端无法连接 AstrBot**！"
+                    f"解决：1) 检查端口 :{sv.listen_port} 是否被占用并 kill；"
+                    f"2) 在配置 SERVERS 里把 listen_port 改成未占用端口，并同步修改 MC 端连接配置。"
                 )
                 continue
             self._http_runners.append((runner, site, sv.listen_port))
             started_sites[port_key] = (app, runner, site)
-        # 记录"哪些 listen_port 成功启动了"，供 _handle_mc_chat 快速检测端口占用场景
-        self._ports_ok: set[int] = set(port for (_, _, port) in self._http_runners)
 
-    async def _listen_port_ok(self, sv: ServerCfg) -> bool:
-        """判断该 sv 的 listen_port 是否处于成功启动状态（端口占用返回 False，玩家看到诊断）。"""
-        return bool(getattr(self, "_ports_ok", None) and sv.listen_port in self._ports_ok)
-
-    async def _check_token(self, request, sv: ServerCfg) -> bool:
-        token = (sv.bridge_token or "").strip()
-        if not token:
-            return True
-        auth = request.headers.get("Authorization", "")
-        if auth == f"Bearer {token}" or request.headers.get("X-Bridge-Token", "") == token:
-            return True
-        return False
-
-    async def _handle_mc_chat(self, request, sv: ServerCfg):
-        if not await self._check_token(request, sv):
+    async def _handle_ws(self, request):
+        # 从 URL query 获取 token 和 server_name
+        token = request.query.get("token", "").strip()
+        server_name = request.query.get("server_name", "").strip()
+        # 验证 token（匹配任一已配置的 ServerCfg.bridge_token）
+        matched_sv: Optional[ServerCfg] = None
+        for sv in self._servers.values():
+            t = (sv.bridge_token or "").strip()
+            if t and t == token:
+                matched_sv = sv
+                break
+        if matched_sv is None:
+            # 兼容：token 为空时也接受（未配置 token 的服）
+            for sv in self._servers.values():
+                if not (sv.bridge_token or "").strip():
+                    matched_sv = sv
+                    break
+        if matched_sv is None:
+            logger.warning(f"[MCBridge] WS连接拒绝: token不匹配 (server_name={server_name})")
             return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        sv = matched_sv
+        # 根据 server_name 找到 ServerCfg（匹配不到用 matched_sv）
+        if server_name and server_name in self._servers:
+            sv = self._servers[server_name]
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        self._ws_connections[sv.name] = {"ws": ws, "sv": sv}
+        logger.info(
+            f"[MCBridge] WS连接建立: server={sv.name} (上报server_name={server_name or sv.name}) "
+            f"listen_port={sv.listen_port}"
+        )
         try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"ok": False, "error": "bad json"}, status=400)
-        player = str(data.get("player", "") or "").strip()
-        display = str(data.get("display_name", "") or player).strip()
-        message = str(data.get("message", "") or "").strip()
-        ts = data.get("timestamp") or int(time.time() * 1000)
-        player_uuid = str(data.get("player_uuid", "") or "").strip()  # 正版UUID
-        server_name_report = str(data.get("server_name", "") or sv.name).strip()
-        is_command = bool(data.get("is_command", False))
-        if not player or not message:
-            return web.json_response({"ok": False, "error": "missing player/message"}, status=400)
-
-        # 🔴 最优先：sv.listen_port 自己没绑成功（被其他进程抢占）
-        # → 只打后台日志，不给玩家塞 pending（诊断放后台）
-        if not await self._listen_port_ok(sv):
-            logger.error(
-                f"[MCBridge][{sv.name}] listen_port :{sv.listen_port} 未成功启动(被占用)，"
-                f"MC端命令无法被正确接收。请 kill 占用进程或改端口。"
-            )
-            return web.json_response({"ok": False, "error": f"listen_port :{sv.listen_port} not started (port occupied)"})
-
-        # ------------------------------------------------------------------
-        # 关键修复：命令事件（/bind /unbind /ai）改为同步 await 处理，不再 _spawn 后台
-        # 否则 _handle_mc_chat 只等 0.3s 就去 dequeue，而绑定流程（私聊2.5s+群遍历）远没完成，
-        # pending 队列必然为空 → Java 端拿不到 pending_messages[] → 玩家"没下文"。
-        # 总超时 3.8s（小于 Java 端 read_timeout=5s），到点强制取消并塞一条"处理中"pending 回执。
-        # ------------------------------------------------------------------
-        if is_command:
-            started = time.time()
-            try:
-                await asyncio.wait_for(
-                    self._mc_message_safe_wrapper_sync(
-                        sv, player, display, message, int(ts), player_uuid, server_name_report, True
-                    ),
-                    timeout=3.8,
-                )
-            except asyncio.TimeoutError:
-                # 超时（大概率在 _qq_send_private 等待 OneBot 返回 / 或在发群消息）：
-                # 告诉玩家"提交成功，稍后留意私聊/共同群"，后台继续跑完
-                self._spawn(
-                    self._mc_message_safe_wrapper_silent(
-                        sv, player, display, message, int(ts), player_uuid, server_name_report
-                    )
-                )
-                msg = (
-                    "🔄 请求已提交到 AstrBot。若 15 秒后 MC 内还是没收到回执且 QQ 私聊/群里也没收到"
-                    f"机器人@你，请检查：AstrBot 端 host={sv.host!r} mc_bridge_port={sv.mc_bridge_port} "
-                    f"bridge_token 是否与 MC 端 config.yml 一致；或 AstrBot 是否先收到过一条 QQ 消息激活机器人。"
-                )
-                await self._enqueue_pending_reply(sv.name, player, msg, "info")
-            except Exception as e:
-                logger.exception(f"[MCBridge][{sv.name}] 同步处理命令异常: player={player} msg={message!r}")
-                await self._enqueue_pending_reply(
-                    sv.name, player,
-                    f"[Bridge 内部错误：{type(e).__name__}] 请管理员查看 AstrBot 日志",
-                    "error",
-                )
-        else:
-            # 聊天消息仍用后台执行（没必要同步阻塞 HTTP）；先前残留的 pending 也会被带回去
-            self._spawn(
-                self._mc_message_safe_wrapper_silent(
-                    sv, player, display, message, int(ts), player_uuid, server_name_report
-                )
-            )
-
-        # 统一取出 pending（同步处理已经入队了）
-        pending = await self._dequeue_pending_replies(sv.name, player)
-        resp_body = {"ok": True}
-        if pending:
-            simplified: list[dict] = []
-            for p in pending:
-                level = str(p.get("level", "info") or "info")
-                prefix = {
-                    "error": "§c[Bridge] ",
-                    "success": "§a[Bridge] ",
-                    "info": "§7[Bridge] ",
-                }.get(level, "§7[Bridge] ")
-                simplified.append({
-                    "text": f"{prefix}{p.get('msg', '')}",
-                    "level": level,
-                })
-            resp_body["pending_messages"] = simplified
-        return web.json_response(resp_body)
-
-    async def _mc_message_safe_wrapper_sync(
-        self, sv, player, display, message, ts, player_uuid, reported_srv, is_command
-    ):
-        """同步版本：直接 await _on_mc_message，异常时走 tellraw_private（反向桥不通就入队 pending）。"""
-        await self._mc_message_safe_wrapper(sv, player, display, message, ts, player_uuid, reported_srv, is_command)
-
-    async def _mc_message_safe_wrapper_silent(
-        self, sv, player, display, message, ts, player_uuid, reported_srv
-    ):
-        """后台静默版（已给玩家发过 🔄 处理中 的提示），跑完不再发同一条回执。只跑实际动作。"""
-        try:
-            await self._on_mc_message(sv, player, display, message, ts, player_uuid, reported_srv)
-        except Exception as e:
-            logger.exception(f"[MCBridge][{sv.name}] 后台静默处理MC消息异常: player={player} msg={message!r}")
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception as e:
+                        logger.debug(f"[MCBridge][{sv.name}] WS收到非JSON消息: {e}")
+                        continue
+                    mtype = str(data.get("type", "") or "").strip()
+                    if mtype == "handshake":
+                        om_reported = data.get("online_mode")
+                        reported_name = str(data.get("server_name", "") or "").strip()
+                        if isinstance(om_reported, bool):
+                            sv.online_mode = om_reported
+                            self._handshake_state[sv.name] = om_reported
+                            try:
+                                self._save_json(STATE_FILE, self._handshake_state)
+                            except Exception:
+                                pass
+                            logger.info(
+                                f"[MCBridge] 服务器[{sv.name}]握手: online_mode={om_reported}"
+                                f" (上报server_name={reported_name or sv.name})"
+                            )
+                    elif mtype in ("chat", "command"):
+                        player = str(data.get("player", "") or "").strip()
+                        display = str(data.get("display_name", "") or player).strip()
+                        message = str(data.get("message", "") or "").strip()
+                        ts = data.get("timestamp") or int(time.time() * 1000)
+                        player_uuid = str(data.get("player_uuid", "") or "").strip()
+                        reported_srv = str(data.get("server_name", "") or sv.name).strip()
+                        is_command = bool(data.get("is_command", False)) or mtype == "command"
+                        if not player or not message:
+                            continue
+                        # 命令和聊天都走 _spawn 后台执行（WS 不需要返回响应体）
+                        self._spawn(
+                            self._mc_message_safe_wrapper(
+                                sv, player, display, message, int(ts), player_uuid, reported_srv, is_command
+                            )
+                        )
+                    elif mtype == "execute_result":
+                        request_id = str(data.get("request_id", "") or "").strip()
+                        fut = self._exec_futures.get(request_id)
+                        if fut is not None and not fut.done():
+                            try:
+                                fut.set_result({
+                                    "success": bool(data.get("success", False)),
+                                    "output": str(data.get("output", "") or ""),
+                                })
+                            except Exception:
+                                pass
+                elif msg.type == aiohttp.WSMsgType.CLOSE:
+                    break
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.warning(f"[MCBridge][{sv.name}] WS连接异常: {ws.exception()!r}")
+                    break
+        finally:
+            # 连接关闭后从 _ws_connections 移除（仅当存的还是本 ws 时才移除，避免误删新连接）
+            if self._ws_connections.get(sv.name, {}).get("ws") is ws:
+                self._ws_connections.pop(sv.name, None)
+            logger.info(f"[MCBridge] WS连接断开: server={sv.name}")
+        return ws
 
     async def _mc_message_safe_wrapper(
         self,
@@ -619,51 +535,6 @@ class MCBridgePlugin(Star):
                     )
             except Exception:
                 pass
-
-    async def _handle_mc_handshake(self, request, sv: ServerCfg):
-        if not await self._check_token(request, sv):
-            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"ok": False, "error": "bad json"}, status=400)
-        om_reported = data.get("online_mode")
-        reported_name = str(data.get("server_name", "") or "").strip()
-        if isinstance(om_reported, bool):
-            sv.online_mode = om_reported
-            self._handshake_state[sv.name] = om_reported
-            try:
-                self._save_json(STATE_FILE, self._handshake_state)
-            except Exception:
-                pass
-            logger.info(
-                f"[MCBridge] 服务器[{sv.name}]握手: online_mode={om_reported}"
-                f" (上报server_name={reported_name or sv.name})"
-            )
-        return web.json_response(
-            {
-                "ok": True,
-                "server": sv.name,
-                "online_mode": sv.online_mode,
-                "timestamp": int(time.time() * 1000),
-            }
-        )
-
-    async def _handle_status(self, request, sv: ServerCfg):
-        return web.json_response(
-            {
-                "ok": True,
-                "server": {
-                    "name": sv.name,
-                    "host": sv.host,
-                    "listen_port": sv.listen_port,
-                    "send_channel": sv.send_channel,
-                    "online_mode": sv.online_mode,
-                    "bot_name": sv.bot_name,
-                },
-                "session_count": len(self._sessions.get(self._mc_session_id(sv), [])),
-            }
-        )
 
     # ------------------------------------------------------------------ 身份合并 / 会话工具 / 消息桥发送
 
@@ -737,91 +608,56 @@ class MCBridgePlugin(Star):
         return f'tellraw {safe} {{"text":"{text_escaped}"}}'
 
     async def _tellraw_broadcast(self, sv: ServerCfg, message: str):
-        """全服 tellraw（普通聊天/系统公告）。"""
+        """全服 tellraw（普通聊天/系统公告）。通过 WS 发完整 tellraw 命令，MC端直接 dispatchCommand。"""
         cmd = self._render_tellraw(sv.tellraw_template, sv.bot_name, message)
-        ok = await self._send_via(sv, cmd)
-        if not ok:
-            # 反向桥不通：塞进队列等下一次正向POST带回来
-            await self._enqueue_pending_reply(sv.name, "*", message, "info")
+        await self._ws_send(sv, {"type": "execute", "command": cmd})
 
     async def _tellraw_private(self, sv: ServerCfg, player: str, message: str, *, with_diagnose: bool = True) -> bool:
         """单独 tellraw 给某玩家（指令回执/错误/绑定提示等）。
 
-        返回：是否发送成功。
-        无论成功与否，如果反向桥不通，都会将消息入队 pending，下一次正向 HTTP 响应体带回 Java 端。
+        返回：是否发送成功。签名与返回值保持不变，调用方无需改动。
         """
         cmd = self._render_tellraw_to(sv.tellraw_private_template, sv.bot_name, player, message)
-        ok = await self._send_via(sv, cmd)
+        ok = await self._ws_send(sv, {"type": "execute", "command": cmd})
         if ok:
             return True
         # 原模板可能太复杂导致发送失败，尝试退化成最简单的 tellraw
         if with_diagnose:
             fallback_cmd = f'tellraw {player} {{"text":"{message}"}}'
-            ok2 = await self._send_via(sv, fallback_cmd)
+            ok2 = await self._ws_send(sv, {"type": "execute", "command": fallback_cmd})
             if ok2:
                 return True
             logger.warning(
-                f"[MCBridge][{sv.name}] tellraw_private(玩家={player}) 两度发送失败，"
-                f"通道={sv.send_channel}，MC端插件是否启动？端口/token是否一致？"
-                f"（已进入 pending 队列，下一次正向交互带回）"
+                f"[MCBridge][{sv.name}] tellraw_private(玩家={player}) WS发送失败，"
+                f"MC端插件是否启动？WS连接是否正常？"
             )
-        # 关键：反向桥不通 → 入队，靠下一次 POST /mc_chat 的响应体带回 Java 端直接 sendMessage
-        level = "error" if ("失败" in message or "❌" in message or "错误" in message) else (
-            "success" if ("✅" in message or "成功" in message or "已" == message[:1]) else "info"
-        )
-        await self._enqueue_pending_reply(sv.name, player, message, level)
         return False
 
-    # ------ 正向回传 pending 队列：解决反向桥不通时的"没下文" ------
-    async def _enqueue_pending_reply(self, server_name: str, player: str, msg: str, level: str):
-        """将一条回执塞入 pending 队列（通常是反向桥 tellraw 失败时）。"""
+    async def _ws_send(self, sv: ServerCfg, msg: dict) -> bool:
+        """通过 WS 连接发送 JSON 消息给 MC 端。返回是否成功。"""
+        conn = self._ws_connections.get(sv.name)
+        if conn is None:
+            # 尝试匹配上报的 server_name（握手时可能用了不同的名字）
+            for name, info in self._ws_connections.items():
+                if info.get("sv") is sv:
+                    conn = info
+                    break
+        if conn is None:
+            logger.warning(f"[MCBridge][{sv.name}] WS连接不存在，无法发送: {msg.get('type')}")
+            return False
+        ws = conn.get("ws")
+        if ws is None or ws.closed:
+            logger.warning(f"[MCBridge][{sv.name}] WS已关闭，无法发送: {msg.get('type')}")
+            return False
         try:
-            async with self._reply_pending_lock:
-                q = self._reply_pending.setdefault(server_name, [])
-                q.append({
-                    "player": player,   # "*" 表示广播给所有玩家（fallback不常用）
-                    "msg": str(msg),
-                    "level": level,     # "info" / "error" / "success"
-                    "ts": time.time(),
-                })
-                # 最多积压 200 条，防止内存泄漏
-                if len(q) > 200:
-                    q[:] = q[-200:]
+            await ws.send_json(msg)
+            return True
         except Exception as e:
-            logger.debug(f"[MCBridge] enqueue pending 失败: {e}")
-
-    async def _dequeue_pending_replies(self, server_name: str, player: str) -> list[dict]:
-        """原子取出匹配该服务器+该玩家的 pending 回执（同时取出"*"广播），并从队列里移除。"""
-        try:
-            async with self._reply_pending_lock:
-                q = self._reply_pending.get(server_name)
-                if not q:
-                    return []
-                take: list[dict] = []
-                rest: list[dict] = []
-                for item in q:
-                    if item.get("player") == player or item.get("player") == "*":
-                        # 只取本次请求玩家匹配的（10秒内的老消息也不丢弃，除非超过60秒）
-                        age = time.time() - float(item.get("ts", 0))
-                        if age < 120:
-                            take.append(item)
-                        # 过期就直接丢掉，不进 rest
-                    else:
-                        rest.append(item)
-                # 超过60秒的 rest 也清掉
-                now = time.time()
-                rest = [x for x in rest if now - float(x.get("ts", 0)) < 120]
-                if rest:
-                    self._reply_pending[server_name] = rest
-                else:
-                    self._reply_pending.pop(server_name, None)
-                return take
-        except Exception as e:
-            logger.debug(f"[MCBridge] dequeue pending 失败: {e}")
-            return []
+            logger.warning(f"[MCBridge][{sv.name}] WS发送异常: {e}")
+            return False
 
     async def _send_via(self, sv: ServerCfg, command: str):
-        """统一 bridge/rcon 发送MC命令。"""
+        """统一 bridge/rcon 发送MC命令。bridge 模式走 WS（不再有反向HTTP通道）。"""
         if sv.send_channel == "rcon":
             try:
                 await self._rcon_command(
@@ -831,7 +667,7 @@ class MCBridgePlugin(Star):
             except Exception as e:
                 logger.debug(f"[MCBridge][{sv.name}] rcon发送失败: {e}")
                 return False
-        return await self._send_via_bridge(sv, command)
+        return await self._ws_send(sv, {"type": "execute", "command": command})
 
     async def _cache_bot_from_event(self, event: AstrMessageEvent):
         """旁路缓存 bot 引用（后续MC→QQ消息发送、绑定私聊确认复用）。"""
@@ -1175,7 +1011,7 @@ class MCBridgePlugin(Star):
         await self._tellraw_private(sv, player, "自然语言指令解析失败。")
 
     async def _exec_and_capture_output(self, sv: ServerCfg, cmd: str) -> str:
-        """执行MC命令并尝试捕获输出。bridge模式通过 /execute 通道的body拿到返回；RCON也返回一行文本。"""
+        """执行MC命令并捕获输出。bridge模式通过 WS 发 execute 等待 MC 端回 execute_result；RCON直接返回。"""
         real_cmd = cmd[1:] if cmd.startswith("/") else cmd
         if sv.send_channel == "rcon":
             try:
@@ -1183,26 +1019,26 @@ class MCBridgePlugin(Star):
                 return (res or "").strip()
             except Exception as e:
                 return f"[RCON 错误] {e}"
-        # bridge 模式
-        url = f"http://{sv.host}:{sv.mc_bridge_port}/execute"
-        if self._client_session is None or self._client_session.closed:
-            self._client_session = aiohttp.ClientSession()
-        headers = {"Content-Type": "application/json"}
-        if sv.bridge_token.strip():
-            headers["Authorization"] = f"Bearer {sv.bridge_token.strip()}"
+        # bridge 模式：通过 WS 发 execute，等待 execute_result
+        import uuid as _uuid
+        request_id = str(_uuid.uuid4())
+        fut = asyncio.get_event_loop().create_future()
+        self._exec_futures[request_id] = fut
+        ok = await self._ws_send(sv, {"type": "execute", "command": real_cmd, "request_id": request_id})
+        if not ok:
+            self._exec_futures.pop(request_id, None)
+            return "[Bridge WS发送失败]"
         try:
-            async with self._client_session.post(
-                url,
-                json={"command": real_cmd},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                body = (await resp.text()).strip()
-                if resp.status != 200:
-                    return f"[Bridge 错误 {resp.status}] {body[:200]}"
-                return body or ""
-        except Exception as e:
-            return f"[Bridge 请求失败] {e}"
+            result = await asyncio.wait_for(fut, timeout=10)
+            self._exec_futures.pop(request_id, None)
+            success = result.get("success", False)
+            output = result.get("output", "")
+            if not success:
+                return f"[执行失败] {output}" if output else "[执行失败]"
+            return output or ""
+        except asyncio.TimeoutError:
+            self._exec_futures.pop(request_id, None)
+            return "[Bridge 执行超时(10s)]"
 
     async def _mc_nl_route_with_llm(self, sv: ServerCfg, player: str, display: str, content: str, perm: str, forced: bool) -> dict:
         """LLM路由：返回 {action: 'deny'|'execute_safe'|'not_command', ...}。
@@ -1663,33 +1499,6 @@ class MCBridgePlugin(Star):
             return None
         return reply.strip().strip('"').strip("'") or None
 
-    async def _send_via_bridge(self, sv: ServerCfg, command: str) -> bool:
-        url = f"http://{sv.host}:{sv.mc_bridge_port}/execute"
-        if self._client_session is None or self._client_session.closed:
-            self._client_session = aiohttp.ClientSession()
-        headers = {"Content-Type": "application/json"}
-        if sv.bridge_token.strip():
-            headers["Authorization"] = f"Bearer {sv.bridge_token.strip()}"
-        try:
-            async with self._client_session.post(
-                url,
-                json={"command": command},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(
-                        f"[MCBridge][{sv.name}] bridge执行失败 status={resp.status} body={body[:200]}"
-                    )
-                    return False
-                return True
-        except Exception as e:
-            logger.warning(
-                f"[MCBridge][{sv.name}] bridge请求失败 (确认MC端插件启动、端口/token一致): {e}"
-            )
-            return False
-
     async def _send_via_rcon(self, sv: ServerCfg, command: str) -> bool:
         if not sv.mc_rcon_password:
             logger.warning(f"[MCBridge][{sv.name}] RCON 模式但未设置密码，跳过")
@@ -2137,7 +1946,7 @@ class MCBridgePlugin(Star):
                 return False, f"RCON失败: {e}"
         else:
             try:
-                ok = await self._send_via_bridge(sv, command)
+                ok = await self._send_via(sv, command)
                 if ok:
                     return True, "bridge执行成功(无返回)"
                 return False, "bridge执行失败(见日志)"
